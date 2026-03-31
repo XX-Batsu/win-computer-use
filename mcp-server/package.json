@@ -1,0 +1,19 @@
+{
+  "name": "win-computer-use-mcp",
+  "version": "0.1.0",
+  "description": "MCP server bridging Claude to the win-computer-use Windows automation engine",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^22.0.0"
+  }
+}

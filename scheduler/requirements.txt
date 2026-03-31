@@ -1,0 +1,7 @@
+pydantic==2.10.5
+pyyaml==6.0.2
+requests==2.32.3
+croniter==5.0.1
+winotify==1.1.0
+psutil==6.1.1
+python-dotenv==1.0.1

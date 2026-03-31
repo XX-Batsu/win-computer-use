@@ -1,0 +1,71 @@
+# tasks/example.yaml
+#
+# Example task definitions for the Windows Computer Use scheduler.
+# Copy or extend this file to define your own automated tasks.
+#
+# Each task is validated against the Task Pydantic model.
+# Required fields: name, cron, prompt
+# All other fields are optional and fall back to documented defaults.
+#
+# Field reference:
+#   name                  — Unique task identifier (non-empty string)
+#   cron                  — 5-field cron expression (minute hour dom month dow)
+#   model                 — Claude model ID (default: claude-sonnet-4-6)
+#   max_steps             — Max agentic steps before giving up (1–100)
+#   step_timeout_seconds  — Seconds to wait per step (5–300, default: 60)
+#   notify_on_finish      — Send a desktop notification when done (default: false)
+#   prompt                — Instructions given to Claude for this task (non-empty)
+
+# ---------------------------------------------------------------------------
+# Task 1: Daily desktop screenshot
+# Runs every day at 09:00. Takes a screenshot and saves it to a reports folder.
+# ---------------------------------------------------------------------------
+- name: daily-screenshot
+  cron: "0 9 * * *"
+  model: claude-sonnet-4-6
+  max_steps: 20
+  step_timeout_seconds: 60
+  notify_on_finish: true
+  prompt: |
+    Take a screenshot of the current desktop and save it to %USERPROFILE%/Documents/reports/.
+    Use the available tools to accomplish this.
+
+# ---------------------------------------------------------------------------
+# Task 2: Weekday browser check
+# Runs Monday–Friday at 08:30. Opens a browser, navigates to an internal
+# dashboard, and logs the page title to %USERPROFILE%/Documents/reports/dashboard-check.log.
+# Useful for verifying that a web service is reachable before the work day.
+# ---------------------------------------------------------------------------
+- name: weekday-dashboard-check
+  cron: "30 8 * * 1-5"
+  model: claude-sonnet-4-6
+  max_steps: 15
+  step_timeout_seconds: 90
+  notify_on_finish: false
+  prompt: |
+    Open the default web browser and navigate to http://localhost:3000.
+    Wait for the page to finish loading (up to 30 seconds).
+    Capture the page title and current timestamp, then append a single line
+    in the format "YYYY-MM-DD HH:MM  <page title>" to the file
+    %USERPROFILE%/Documents/reports/dashboard-check.log, creating the file if it does not exist.
+    Close the browser tab when done.
+
+# ---------------------------------------------------------------------------
+# Task 3: Weekly temp-file cleanup
+# Runs every Sunday at 02:00. Deletes files older than 7 days from a
+# designated temp folder to keep disk usage in check.
+# ---------------------------------------------------------------------------
+- name: weekly-temp-cleanup
+  cron: "0 2 * * 0"
+  model: claude-sonnet-4-6
+  max_steps: 30
+  step_timeout_seconds: 120
+  notify_on_finish: true
+  prompt: |
+    Delete all files in %USERPROFILE%/Documents/temp/ that were last modified more than 7 days ago.
+    Do not delete subdirectories — only files at the top level of %USERPROFILE%/Documents/temp/.
+    After deletion, write a summary line to %USERPROFILE%/Documents/reports/cleanup.log in the
+    format "YYYY-MM-DD HH:MM  Deleted N file(s)" where N is the count of
+    files removed.
+    If %USERPROFILE%/Documents/temp/ does not exist, log "%USERPROFILE%/Documents/temp/ not found — nothing to clean" and
+    exit without error.
