@@ -42,6 +42,12 @@ _engine_dir = str(Path(__file__).parent)
 if _engine_dir not in sys.path:
     sys.path.insert(0, _engine_dir)
 
+# The routers use `from engine import …` which requires the *parent* of engine/
+# to be on sys.path so Python can resolve the `engine` package.
+_project_root = str(Path(__file__).resolve().parent.parent)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 # ---------------------------------------------------------------------------
 # Step 2: Load .env before anything reads os.environ
 # ---------------------------------------------------------------------------
