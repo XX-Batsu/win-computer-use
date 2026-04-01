@@ -14,13 +14,15 @@ _monitor_map : list[dict]
 
 Map entry schema (all values are integers except scale which is float):
 {
-    "logical_left":   int,
-    "logical_top":    int,
-    "logical_right":  int,
-    "logical_bottom": int,
-    "physical_left":  int,
-    "physical_top":   int,
-    "scale":          float,
+    "logical_left":    int,
+    "logical_top":     int,
+    "logical_right":   int,
+    "logical_bottom":  int,
+    "physical_left":   int,
+    "physical_top":    int,
+    "physical_right":  int,
+    "physical_bottom": int,
+    "scale":           float,
 }
 """
 
@@ -108,7 +110,7 @@ def build_monitor_map() -> List[Dict]:
 
     Returns a list of dicts with keys:
         logical_left, logical_top, logical_right, logical_bottom,
-        physical_left, physical_top, scale
+        physical_left, physical_top, physical_right, physical_bottom, scale
     """
     entries: List[Dict] = []
 
@@ -128,6 +130,8 @@ def build_monitor_map() -> List[Dict]:
             "logical_bottom": rect.bottom,
             "physical_left":  phys_left,
             "physical_top":   phys_top,
+            "physical_right":  phys_left + int((rect.right  - rect.left) * scale),
+            "physical_bottom": phys_top  + int((rect.bottom - rect.top)  * scale),
             "scale":          scale,
         })
         return True  # continue enumeration
@@ -141,17 +145,19 @@ def build_monitor_map() -> List[Dict]:
             "logical_left": 0, "logical_top": 0,
             "logical_right": 65535, "logical_bottom": 65535,
             "physical_left": 0, "physical_top": 0,
+            "physical_right": 65535, "physical_bottom": 65535,
             "scale": 1.0,
         })
 
     logger.info("DPI map built: %d monitor(s)", len(entries))
     for i, m in enumerate(entries):
         logger.info(
-            "  monitor %d: logical=(%d,%d)-(%d,%d) physical=(%d,%d) scale=%.2f",
+            "  monitor %d: logical=(%d,%d)-(%d,%d) physical=(%d,%d)-(%d,%d) scale=%.2f",
             i,
             m["logical_left"], m["logical_top"],
             m["logical_right"], m["logical_bottom"],
             m["physical_left"], m["physical_top"],
+            m["physical_right"], m["physical_bottom"],
             m["scale"],
         )
     return entries
@@ -215,3 +221,41 @@ def logical_to_physical(
     phys_x = primary["physical_left"] + int((logical_x - primary["logical_left"]) * scale)
     phys_y = primary["physical_top"]  + int((logical_y - primary["logical_top"])  * scale)
     return phys_x, phys_y, scale
+
+
+def physical_to_logical(
+    phys_x: int,
+    phys_y: int,
+    monitor_map: List[Dict],
+) -> Tuple[int, int, float]:
+    """
+    Convert physical pixel coordinates to logical pixel coordinates.
+
+    Returns (logical_x, logical_y, scale).
+
+    Inverse of logical_to_physical(). If the point falls outside every
+    known monitor rectangle the primary monitor's scale is used and a
+    warning is logged.
+    """
+    for m in monitor_map:
+        if (m["physical_left"] <= phys_x < m["physical_right"] and
+                m["physical_top"] <= phys_y < m["physical_bottom"]):
+            scale = m["scale"]
+            logical_x = m["logical_left"] + round((phys_x - m["physical_left"]) / scale)
+            logical_y = m["logical_top"]  + round((phys_y - m["physical_top"])  / scale)
+            return logical_x, logical_y, scale
+
+    # Outside all monitors — fall back to primary scale
+    logger.warning(
+        "Physical coordinate (%d, %d) is outside all known monitors; using primary scale",
+        phys_x, phys_y,
+    )
+    primary = monitor_map[0] if monitor_map else {
+        "physical_left": 0, "physical_top": 0,
+        "logical_left": 0, "logical_top": 0,
+        "scale": 1.0,
+    }
+    scale = primary["scale"]
+    logical_x = primary["logical_left"] + round((phys_x - primary["physical_left"]) / scale)
+    logical_y = primary["logical_top"]  + round((phys_y - primary["physical_top"])  / scale)
+    return logical_x, logical_y, scale

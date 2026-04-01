@@ -106,6 +106,15 @@ except Exception as _pyvda_exc:  # noqa: BLE001
     _pyvda_available = False
     logging.warning(f"pyvda unavailable: {_pyvda_exc} — /desktop/* endpoints will return 503")
 
+# pywinauto is optional — log availability separately
+try:
+    import pywinauto  # noqa: F401
+    _pywinauto_available = True
+    logger.info("pywinauto available")
+except Exception as _pywinauto_exc:  # noqa: BLE001
+    _pywinauto_available = False
+    logging.warning(f"pywinauto unavailable: {_pywinauto_exc} — /find_element and /element_at endpoints will return 503")
+
 # ---------------------------------------------------------------------------
 # Step 5: Per-monitor DPI map — single source of truth is dpi_utils
 # ---------------------------------------------------------------------------
@@ -150,6 +159,7 @@ from engine.routers import (  # noqa: E402
     clipboard,
     shell,
     desktop,
+    uia,
 )
 
 ENGINE_VERSION = "0.1.0"
@@ -172,6 +182,7 @@ app.include_router(window.router)
 app.include_router(clipboard.router)
 app.include_router(shell.router)
 app.include_router(desktop.router)
+app.include_router(uia.router)
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +196,7 @@ async def health(request: Request):
             "version": ENGINE_VERSION,
             "dpi_map": get_dpi_map(),
             "pyvda_available": _pyvda_available,
+            "pywinauto_available": _pywinauto_available,
             "dependencies": _dep_status,
         },
         "error": None,

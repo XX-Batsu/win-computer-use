@@ -5,7 +5,10 @@ Captures a screen region (or full virtual screen) using mss, converts to PNG,
 and returns base64-encoded image data together with DPI metadata.
 
 Coordinates in the request body are logical pixels; the engine converts them to
-physical pixels before passing them to mss.
+physical pixels before passing them to mss.  The captured image is then
+downscaled from physical pixels back to logical pixels so that pixel coordinates
+in the returned image match the logical coordinate system used by all other
+tools (e.g. mouse_click).
 """
 
 import base64
@@ -78,8 +81,14 @@ async def take_screenshot(req: ScreenshotRequest):
 
             screenshot = sct.grab(monitor)
 
-            # Convert mss ScreenShot → PIL Image → PNG bytes → base64
+            # Convert mss ScreenShot → PIL Image (physical pixels)
             img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+
+            # P0: Downscale to logical size so pixel coords = logical coords
+            if dpi_scale != 1.0:
+                logical_size = (round(img.width / dpi_scale), round(img.height / dpi_scale))
+                img = img.resize(logical_size, Image.LANCZOS)
+
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             b64 = base64.b64encode(buf.getvalue()).decode("ascii")

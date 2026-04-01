@@ -362,6 +362,45 @@ const TOOLS: Tool[] = [
       required: ["index"],
     },
   },
+  {
+    name: "find_element",
+    description:
+      "Search for UI elements by name, type, or automation ID within a window. " +
+      "Use this for precise coordinates of small, dense, or hard-to-distinguish elements " +
+      "(list items, menu entries, toolbar buttons). Use list_windows first to get the window " +
+      "handle, or pass a title substring. Prefer screenshot + visual coordinate picking for " +
+      `large, obvious targets. ${COORD_NOTE}`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        hwnd: { type: "integer", description: "Window handle from list_windows" },
+        title: { type: "string", description: "Window title substring (alternative to hwnd)" },
+        name: { type: "string", description: "Element name to search for (partial match, case-insensitive)" },
+        control_type: {
+          type: "string",
+          description: "UI Automation control type, e.g. Button, ListItem, Edit, CheckBox, MenuItem",
+        },
+        automation_id: { type: "string", description: "Automation ID (exact match)" },
+        max_depth: { type: "integer", description: "Search depth limit (default 5, max 20)" },
+        max_results: { type: "integer", description: "Maximum elements to return (default 20, max 100)" },
+        timeout: { type: "number", description: "Search timeout in seconds (default 5.0, max 30)" },
+      },
+    },
+  },
+  {
+    name: "element_at",
+    description:
+      "Identify the UI element at a given logical coordinate. Use after taking a screenshot " +
+      `to understand what a specific UI element is before clicking it. ${COORD_NOTE}`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "number", description: "X coordinate in logical pixels" },
+        y: { type: "number", description: "Y coordinate in logical pixels" },
+      },
+      required: ["x", "y"],
+    },
+  },
 ];
 
 // ── Tool handler ─────────────────────────────────────────────────────────────
@@ -556,6 +595,32 @@ async function handleTool(
         const resp = await engineDelete<unknown>(`/desktop/${String(args.index)}`);
         if (!resp.success) return errorContent(`delete_desktop failed: ${resp.error}`);
         return textContent(`Desktop ${String(args.index)} deleted.`);
+      }
+
+      // ── UI Automation ───────────────────────────────────────────────────
+      case "find_element": {
+        const body: Record<string, unknown> = {};
+        if (args.hwnd !== undefined) body.hwnd = args.hwnd;
+        if (args.title !== undefined) body.title = args.title;
+        if (args.name !== undefined) body.name = args.name;
+        if (args.control_type !== undefined) body.control_type = args.control_type;
+        if (args.automation_id !== undefined) body.automation_id = args.automation_id;
+        if (args.max_depth !== undefined) body.max_depth = args.max_depth;
+        if (args.max_results !== undefined) body.max_results = args.max_results;
+        if (args.timeout !== undefined) body.timeout = args.timeout;
+        const resp = await enginePost<unknown>("/find_element", body);
+        if (!resp.success) return errorContent(`find_element failed: ${resp.error}`);
+        return textContent(JSON.stringify(resp.data, null, 2));
+      }
+
+      case "element_at": {
+        const resp = await enginePost<unknown>("/element_at", {
+          x: args.x,
+          y: args.y,
+        });
+        if (!resp.success) return errorContent(`element_at failed: ${resp.error}`);
+        if (resp.data === null) return textContent("No element found at this coordinate.");
+        return textContent(JSON.stringify(resp.data, null, 2));
       }
 
       default:

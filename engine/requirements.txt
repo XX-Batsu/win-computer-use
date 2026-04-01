@@ -2,10 +2,11 @@ fastapi==0.115.6
 uvicorn[standard]==0.32.1
 mss==9.0.2
 pyautogui==0.9.54
-pillow==11.1.0
+pillow==12.1.1
 pywin32==311
 pyperclip==1.9.0
-pyvda==0.3.1
+pyvda==0.5.0
+pywinauto==0.6.8
 python-dotenv==1.0.1
 winotify==1.1.0
 psutil==6.1.1
