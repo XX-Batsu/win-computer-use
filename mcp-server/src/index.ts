@@ -10,6 +10,14 @@ import {
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
+import {
+  SCREENSHOT_MAX_W,
+  SCREENSHOT_MAX_H,
+  toLogicalPos,
+  toLogicalDimCoord,
+  toImageCoord,
+  toImageDimCoord,
+} from "./coords.js";
 
 // ── Config resolution ────────────────────────────────────────────────────────
 
@@ -119,22 +127,33 @@ function textContent(text: string): { content: TextContent[] } {
 }
 
 // ── Coordinate remapping ────────────────────────────────────────────────────
-// Screenshots are resized to fit within 1920×1080 for Claude-friendly token usage.
-// imageScale converts image-pixel coords back to logical coords: logical = image / imageScale.
+// Coordinates in tool arguments are always in "current screenshot image pixels".
+// The MCP layer converts them to logical pixels before sending to the engine.
+//
+// State updated by the screenshot handler after every successful capture:
+//   imageScale        — scale of the last FULL-SCREEN shot (used for initImageScale)
+//   currentImageScale — scale of the last shot (full or crop)
+//   cropOffsetX/Y     — logical-pixel origin of the last crop (0,0 for full-screen)
 
 let imageScale = 1.0;
+let currentImageScale = 1.0;
+let cropOffsetX = 0;
+let cropOffsetY = 0;
 
-/** Map a coordinate from the (possibly resized) screenshot space to logical pixels. */
-function toLogical(v: number): number {
-  return imageScale === 1.0 ? v : Math.round(v / imageScale);
-}
+/** X position: scale by currentImageScale then add crop offset. */
+function toLogicalX(v: number): number { return toLogicalPos(v, currentImageScale, cropOffsetX); }
+/** Y position: scale by currentImageScale then add crop offset. */
+function toLogicalY(v: number): number { return toLogicalPos(v, currentImageScale, cropOffsetY); }
+/** Dimension: scale by currentImageScale, no offset. */
+function toLogicalDim(v: number): number { return toLogicalDimCoord(v, currentImageScale); }
+/** Logical X → current screenshot image pixels. */
+function toImageCurrentX(v: number): number { return toImageCoord(v, currentImageScale, cropOffsetX); }
+/** Logical Y → current screenshot image pixels. */
+function toImageCurrentY(v: number): number { return toImageCoord(v, currentImageScale, cropOffsetY); }
+/** Logical dimension → current screenshot image pixels. */
+function toImageCurrentDim(v: number): number { return toImageDimCoord(v, currentImageScale); }
 
-/** Map a coordinate from logical pixels back to screenshot image space. */
-function toImage(v: number): number {
-  return imageScale === 1.0 ? v : Math.round(v * imageScale);
-}
-
-/** Remap bounding_rect and center in element data from logical → image coords. */
+/** Remap bounding_rect and center in element data from logical → current-screenshot image coords. */
 function remapElementCoords(data: unknown): unknown {
   if (data === null || typeof data !== "object") return data;
   if (Array.isArray(data)) return (data as unknown[]).map(remapElementCoords);
@@ -142,15 +161,17 @@ function remapElementCoords(data: unknown): unknown {
   const result: Record<string, unknown> = { ...obj };
   if (obj.center !== null && typeof obj.center === "object") {
     const c = obj.center as { x: number; y: number };
-    result.center = { x: toImage(c.x), y: toImage(c.y) };
+    result.center = { x: toImageCurrentX(c.x), y: toImageCurrentY(c.y) };
   }
   if (obj.bounding_rect !== null && typeof obj.bounding_rect === "object") {
-    const r = obj.bounding_rect as { left: number; top: number; right: number; bottom: number };
+    const r = obj.bounding_rect as { left: number; top: number; right: number; bottom: number; width?: number; height?: number };
     result.bounding_rect = {
-      left: toImage(r.left),
-      top: toImage(r.top),
-      right: toImage(r.right),
-      bottom: toImage(r.bottom),
+      left:   toImageCurrentX(r.left),
+      top:    toImageCurrentY(r.top),
+      right:  toImageCurrentX(r.right),
+      bottom: toImageCurrentY(r.bottom),
+      ...(r.width  !== undefined && { width:  toImageCurrentDim(r.width)  }),
+      ...(r.height !== undefined && { height: toImageCurrentDim(r.height) }),
     };
   }
   return result;
@@ -172,9 +193,10 @@ async function initImageScale(): Promise<void> {
     const body = (await res.json()) as EngineResponse<{ logical_width: number; logical_height: number }>;
     if (body.success) {
       const { logical_width: lw, logical_height: lh } = body.data;
-      if (lw > 1920 || lh > 1080) {
-        imageScale = Math.min(1920 / lw, 1080 / lh);
+      if (lw > SCREENSHOT_MAX_W || lh > SCREENSHOT_MAX_H) {
+        imageScale = Math.min(SCREENSHOT_MAX_W / lw, SCREENSHOT_MAX_H / lh);
       }
+      currentImageScale = imageScale;
       console.error(`imageScale initialized: ${imageScale.toFixed(4)} (screen ${lw}×${lh} logical)`);
     } else {
       console.error(`WARNING: initImageScale — engine returned success=false: ${body.error ?? "unknown"}`);
@@ -193,18 +215,90 @@ async function initImageScale(): Promise<void> {
 const COORD_NOTE =
   "All coordinates are in screenshot pixels (mapped automatically to logical pixels).";
 
-const TOOLS: Tool[] = [
+export const TOOLS: Tool[] = [
   {
     name: "screenshot",
-    description: `Capture a screenshot of the screen or a region. ${COORD_NOTE}`,
+    description:
+      "Capture a screenshot of the screen or a region. " +
+      "Take a full-screen screenshot first to orient yourself, then take crop screenshots of the " +
+      "specific region you need to interact with — crops provide higher effective resolution and " +
+      "reduce token usage. Coordinates from any screenshot (full-screen or crop) can be passed " +
+      "directly to mouse and keyboard tools; the MCP layer remaps them automatically. " +
+      COORD_NOTE,
     inputSchema: {
       type: "object",
       properties: {
-        top: { type: "number", description: "Top edge of capture region in screenshot pixels" },
-        left: { type: "number", description: "Left edge of capture region in screenshot pixels" },
-        width: { type: "number", description: "Width of capture region in screenshot pixels" },
-        height: { type: "number", description: "Height of capture region in screenshot pixels" },
+        top:    { type: "number", description: "Top edge of capture region in screenshot pixels (requires width+height)" },
+        left:   { type: "number", description: "Left edge of capture region in screenshot pixels (requires width+height)" },
+        width:  { type: "number", description: "Width of capture region in screenshot pixels (must be paired with height)" },
+        height: { type: "number", description: "Height of capture region in screenshot pixels (must be paired with width)" },
       },
+    },
+  },
+  {
+    name: "screenshot_zoom",
+    description:
+      "Crop a close-up screenshot region centered at (x, y). No upscaling — returns\n" +
+      "the cropped area at its original screen resolution.\n\n" +
+      "Use after element_at returns no useful element — game UI, images, canvas,\n" +
+      "web pages, map coordinates. Gives a close-up pixel-level view of a single target.\n\n" +
+      "Use width/height to control the crop area (default 200×200 screenshot pixels).\n" +
+      "annotate is true by default and draws a small filled dot (not a crosshair) at the exact center point.\n\n" +
+      "If the crop region extends beyond the screen edge, the out-of-screen portion\n" +
+      "appears as black pixels — this is expected and does not indicate a wrong coordinate.\n\n" +
+      "Prefer screenshot_annotate when you need to see where a coordinate sits in\n" +
+      "full-screen context, or when verifying multiple coordinates at once.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        x:        { type: "number",  description: "Center X coordinate in screenshot pixels" },
+        y:        { type: "number",  description: "Center Y coordinate in screenshot pixels" },
+        width:    { type: "number",  description: "Crop width in screenshot pixels (default 200)" },
+        height:   { type: "number",  description: "Crop height in screenshot pixels (default 200)" },
+        annotate: { type: "boolean", description: "Draw filled dot at center (default true)" },
+      },
+      required: ["x", "y"],
+    },
+  },
+  {
+    name: "screenshot_annotate",
+    description:
+      "Take a screenshot with coordinate markers drawn on it.\n\n" +
+      "Best for: verifying multiple coordinates at once, or when you need to see\n" +
+      "where a point falls within the full-screen context. Prefer screenshot_zoom\n" +
+      "for isolated single-target close-up verification.\n\n" +
+      "Marker types (use \"crosshair\" by default for precision):\n" +
+      "- \"crosshair\": full-width + full-height lines with hollow circle gap at center (sniper-scope style)\n" +
+      "- \"circle\": hollow circle only — use if crosshair lines obscure important content\n" +
+      "- \"both\": crosshair + circle — use when extra visual confirmation is needed\n\n" +
+      "Supports optional crop region (same as screenshot tool).\n" +
+      "Returns skipped_annotations with the indices of any annotations outside the image bounds.\n" +
+      "If skipped_annotations is non-empty, those coordinates were off-screen or outside the\n" +
+      "crop region — re-check the coordinates before acting on them.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        annotations: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              x:           { type: "number", description: "X coordinate in screenshot pixels" },
+              y:           { type: "number", description: "Y coordinate in screenshot pixels" },
+              marker_type: { type: "string", enum: ["crosshair", "circle", "both"], description: "Marker type (default: crosshair)" },
+              color:       { type: "string", description: "PIL named color or hex (default: red)" },
+              radius:      { type: "number", description: "Gap/circle radius in image pixels (default: 10)" },
+            },
+            required: ["x", "y"],
+          },
+          description: "Array of annotation markers to draw",
+        },
+        top:    { type: "number", description: "Top edge of crop region in screenshot pixels" },
+        left:   { type: "number", description: "Left edge of crop region in screenshot pixels" },
+        width:  { type: "number", description: "Width of crop region in screenshot pixels" },
+        height: { type: "number", description: "Height of crop region in screenshot pixels" },
+      },
+      required: ["annotations"],
     },
   },
   {
@@ -532,8 +626,15 @@ const TOOLS: Tool[] = [
   {
     name: "element_at",
     description:
-      "Identify the UI element at a given screenshot coordinate. Use after taking a screenshot " +
-      `to understand what a specific UI element is before clicking it. Returned center and bounding_rect are also in screenshot pixels. ${COORD_NOTE}`,
+      "Identify the UI element at given coordinates using Windows UI Automation.\n" +
+      "Returns element name, control_type, automation_id, and exact bounding_rect.\n\n" +
+      "Try this tool first for any standard UI target.\n" +
+      "Fast and returns semantic info (you know what the element IS, not just what it looks like).\n\n" +
+      "Best for: standard UI controls — buttons, inputs, checkboxes, menus, list items.\n\n" +
+      "Not suitable for: game canvases, browser content, map tiles, custom-drawn areas,\n" +
+      "or any region where UI Automation returns nothing useful.\n" +
+      "Only fall back to screenshot_zoom or screenshot_annotate if this returns an empty\n" +
+      "result or a generic/unhelpful element type.",
     inputSchema: {
       type: "object",
       properties: {
@@ -549,7 +650,7 @@ const TOOLS: Tool[] = [
 
 type Args = Record<string, unknown>;
 
-async function handleTool(
+export async function handleTool(
   name: string,
   args: Args
 ): Promise<
@@ -559,13 +660,17 @@ async function handleTool(
     switch (name) {
       // ── Screenshot ──────────────────────────────────────────────────────
       case "screenshot": {
-        // Match engine semantics: full_screen = (width is None and height is None)
         const isCrop = args.width !== undefined && args.height !== undefined;
         const body: Record<string, number> = {};
-        if (args.top !== undefined) body.top = toLogical(args.top as number);
-        if (args.left !== undefined) body.left = toLogical(args.left as number);
-        if (args.width !== undefined) body.width = toLogical(args.width as number);
-        if (args.height !== undefined) body.height = toLogical(args.height as number);
+
+        // Convert input args from current-screenshot image pixels to logical pixels.
+        // toLogicalX/Y apply the active crop offset, so nested crops work correctly.
+        const logicalLeft = args.left !== undefined ? toLogicalX(args.left as number) : 0;
+        const logicalTop  = args.top  !== undefined ? toLogicalY(args.top  as number) : 0;
+        if (args.left   !== undefined) body.left   = logicalLeft;
+        if (args.top    !== undefined) body.top    = logicalTop;
+        if (args.width  !== undefined) body.width  = toLogicalDim(args.width  as number);
+        if (args.height !== undefined) body.height = toLogicalDim(args.height as number);
 
         const resp = await enginePost<{
           image: string;
@@ -580,9 +685,18 @@ async function handleTool(
           return errorContent(`screenshot failed: ${resp.error ?? "unknown error"}`);
         }
 
-        // Only update imageScale from full-screen shots — cropped shots return scale=1.0 for the crop region
-        if (!isCrop) {
+        if (isCrop) {
+          // Store where this crop sits in full-screen logical space.
+          // Use logicalLeft/Top (already converted) — not raw image-pixel args.
+          cropOffsetX = logicalLeft;
+          cropOffsetY = logicalTop;
+          currentImageScale = resp.data.image_scale;
+          // imageScale (full-screen scale) intentionally NOT updated.
+        } else {
           imageScale = resp.data.image_scale;
+          cropOffsetX = 0;
+          cropOffsetY = 0;
+          currentImageScale = resp.data.image_scale;
         }
 
         const [lw, lh] = resp.data.logical_size;
@@ -602,12 +716,124 @@ async function handleTool(
         return { content: [metaContent, imageContent] };
       }
 
+      // ── Screenshot zoom ─────────────────────────────────────────────────
+      case "screenshot_zoom": {
+        const logicalX = toLogicalX(args.x as number);
+        const logicalY = toLogicalY(args.y as number);
+        const inputW = (args.width as number | undefined) ?? 200;
+        const inputH = (args.height as number | undefined) ?? 200;
+        const logicalW = toLogicalDim(inputW);
+        const logicalH = toLogicalDim(inputH);
+
+        const zoomBody = {
+          x: logicalX,
+          y: logicalY,
+          width: logicalW,
+          height: logicalH,
+          annotate: (args.annotate as boolean | undefined) ?? true,
+        };
+
+        const resp = await enginePost<{
+          image: string;
+          dpi_scale: number;
+          image_scale: number;
+          logical_size: [number, number];
+          image_size: [number, number];
+          physical_size: [number, number];
+          virtual_origin: unknown;
+        }>("/screenshot/zoom", zoomBody);
+
+        if (!resp.success) {
+          return errorContent(`screenshot_zoom failed: ${resp.error ?? "unknown error"}`);
+        }
+
+        // Update crop state so subsequent coordinate inputs (in zoom image pixels) convert correctly.
+        // imageScale (full-screen scale) is intentionally NOT updated — same rule as screenshot crops.
+        cropOffsetX = logicalX - Math.floor(logicalW / 2);
+        cropOffsetY = logicalY - Math.floor(logicalH / 2);
+        currentImageScale = resp.data.image_scale;
+
+        const [lw, lh] = resp.data.logical_size;
+        const [iw, ih] = resp.data.image_size;
+        const [pw, ph] = resp.data.physical_size;
+        const meta =
+          `Zoom screenshot (${iw}\u00d7${ih} image pixels, logical ${lw}\u00d7${lh}, physical ${pw}\u00d7${ph}, ` +
+          `DPI scale ${resp.data.dpi_scale}, image scale ${resp.data.image_scale.toFixed(4)}). ` +
+          `Coordinates from this image are relative to the zoomed region.`;
+
+        return {
+          content: [
+            { type: "text", text: meta } as TextContent,
+            { type: "image", data: resp.data.image, mimeType: "image/png" } as ImageContent,
+          ],
+        };
+      }
+
+      // ── Screenshot annotate ─────────────────────────────────────────────
+      case "screenshot_annotate": {
+        interface AnnotationInput {
+          x: number;
+          y: number;
+          marker_type?: string;
+          color?: string;
+          radius?: number;
+        }
+
+        const annotations = (args.annotations as AnnotationInput[]).map(a => ({
+          ...a,
+          x: toLogicalX(a.x),
+          y: toLogicalY(a.y),
+          // radius is NOT converted — it is a drawing size in image pixels, not a screen coord
+        }));
+
+        const body: Record<string, unknown> = { annotations };
+        if (args.top    !== undefined) body.top    = toLogicalY(args.top    as number);
+        if (args.left   !== undefined) body.left   = toLogicalX(args.left   as number);
+        if (args.width  !== undefined) body.width  = toLogicalDim(args.width  as number);
+        if (args.height !== undefined) body.height = toLogicalDim(args.height as number);
+
+        const resp = await enginePost<{
+          image: string;
+          dpi_scale: number;
+          image_scale: number;
+          logical_size: [number, number];
+          image_size: [number, number];
+          physical_size: [number, number];
+          virtual_origin: unknown;
+          skipped_annotations: number[];
+        }>("/screenshot/annotate", body);
+
+        if (!resp.success) {
+          return errorContent(`screenshot_annotate failed: ${resp.error ?? "unknown error"}`);
+        }
+
+        // screenshot_annotate does NOT update crop state — it is a verification tool,
+        // not a navigation tool. The user still needs to act on the original coordinate space.
+
+        const [lw, lh] = resp.data.logical_size;
+        const [iw, ih] = resp.data.image_size;
+        const skipped = resp.data.skipped_annotations;
+        let meta =
+          `Annotated screenshot: ${iw}\u00d7${ih} image pixels (logical ${lw}\u00d7${lh}, ` +
+          `image scale ${resp.data.image_scale.toFixed(4)}).`;
+        if (skipped.length > 0) {
+          meta += ` WARNING: annotations at indices [${skipped.join(", ")}] were outside the image bounds — re-check those coordinates.`;
+        }
+
+        return {
+          content: [
+            { type: "text", text: meta } as TextContent,
+            { type: "image", data: resp.data.image, mimeType: "image/png" } as ImageContent,
+          ],
+        };
+      }
+
       // ── Mouse ────────────────────────────────────────────────────────────
       case "mouse_move": {
         const resp = await enginePost("/mouse", {
           action: "move",
-          x: toLogical(args.x as number),
-          y: toLogical(args.y as number),
+          x: toLogicalX(args.x as number),
+          y: toLogicalY(args.y as number),
         });
         if (!resp.success) return errorContent(`mouse_move failed: ${resp.error}`);
         return textContent("Mouse moved.");
@@ -616,8 +842,8 @@ async function handleTool(
       case "mouse_click": {
         const resp = await enginePost("/mouse", {
           action: "click",
-          x: toLogical(args.x as number),
-          y: toLogical(args.y as number),
+          x: toLogicalX(args.x as number),
+          y: toLogicalY(args.y as number),
           button: args.button ?? "left",
         });
         if (!resp.success) return errorContent(`mouse_click failed: ${resp.error}`);
@@ -627,8 +853,8 @@ async function handleTool(
       case "mouse_double_click": {
         const resp = await enginePost("/mouse", {
           action: "double_click",
-          x: toLogical(args.x as number),
-          y: toLogical(args.y as number),
+          x: toLogicalX(args.x as number),
+          y: toLogicalY(args.y as number),
           button: args.button ?? "left",
         });
         if (!resp.success) return errorContent(`mouse_double_click failed: ${resp.error}`);
@@ -638,10 +864,10 @@ async function handleTool(
       case "mouse_drag": {
         const body: Record<string, unknown> = {
           action: "drag",
-          x: toLogical(args.x1 as number),
-          y: toLogical(args.y1 as number),
-          x2: toLogical(args.x2 as number),
-          y2: toLogical(args.y2 as number),
+          x: toLogicalX(args.x1 as number),
+          y: toLogicalY(args.y1 as number),
+          x2: toLogicalX(args.x2 as number),
+          y2: toLogicalY(args.y2 as number),
         };
         if (args.button !== undefined) body.button = args.button;
         if (args.duration !== undefined) body.duration = args.duration;
@@ -649,8 +875,8 @@ async function handleTool(
         if (args.steps !== undefined) body.steps = args.steps;
         if (args.waypoints !== undefined) {
           body.waypoints = (args.waypoints as Array<{ x: number; y: number }>).map(wp => ({
-            x: toLogical(wp.x),
-            y: toLogical(wp.y),
+            x: toLogicalX(wp.x),
+            y: toLogicalY(wp.y),
           }));
         }
         const resp = await enginePost("/mouse", body);
@@ -661,8 +887,8 @@ async function handleTool(
       case "mouse_down": {
         const resp = await enginePost("/mouse", {
           action: "mousedown",
-          x: toLogical(args.x as number),
-          y: toLogical(args.y as number),
+          x: toLogicalX(args.x as number),
+          y: toLogicalY(args.y as number),
           button: args.button ?? "left",
         });
         if (!resp.success) return errorContent(`mouse_down failed: ${resp.error}`);
@@ -675,8 +901,8 @@ async function handleTool(
           button: args.button ?? "left",
         };
         if (args.x !== undefined && args.y !== undefined) {
-          body.x = toLogical(args.x as number);
-          body.y = toLogical(args.y as number);
+          body.x = toLogicalX(args.x as number);
+          body.y = toLogicalY(args.y as number);
         }
         const resp = await enginePost("/mouse", body);
         if (!resp.success) return errorContent(`mouse_up failed: ${resp.error}`);
@@ -686,8 +912,8 @@ async function handleTool(
       case "mouse_scroll": {
         const resp = await enginePost("/mouse", {
           action: "scroll",
-          x: toLogical(args.x as number),
-          y: toLogical(args.y as number),
+          x: toLogicalX(args.x as number),
+          y: toLogicalY(args.y as number),
           amount: args.amount,
         });
         if (!resp.success) return errorContent(`mouse_scroll failed: ${resp.error}`);
@@ -826,8 +1052,8 @@ async function handleTool(
 
       case "element_at": {
         const resp = await enginePost<unknown>("/element_at", {
-          x: toLogical(args.x as number),
-          y: toLogical(args.y as number),
+          x: toLogicalX(args.x as number),
+          y: toLogicalY(args.y as number),
         });
         if (!resp.success) return errorContent(`element_at failed: ${resp.error}`);
         if (resp.data === null) return textContent(resp.error ?? "No element found at this coordinate.");

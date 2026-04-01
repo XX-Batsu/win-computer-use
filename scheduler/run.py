@@ -262,11 +262,22 @@ def check_engine_health() -> bool:
         return False
 
 
+_image_scale: float = 1.0
+"""Scale factor from the last screenshot (image pixels / logical pixels)."""
+
+
 def take_screenshot() -> bytes:
-    """Capture full-screen screenshot; return raw PNG bytes."""
+    """Capture full-screen screenshot; return raw PNG bytes.
+
+    Also updates the module-level ``_image_scale`` so that
+    ``dispatch_command`` can remap coordinates from image-pixel space
+    back to logical-pixel space.
+    """
+    global _image_scale
     result = _engine_post("/screenshot", {}, timeout=60)
     if not result.get("success"):
         raise RuntimeError(f"Screenshot failed: {result.get('error')}")
+    _image_scale = result["data"].get("image_scale", 1.0)
     image_b64: str = result["data"]["image"]
     return base64.b64decode(image_b64)
 
@@ -274,6 +285,11 @@ def take_screenshot() -> bytes:
 # ===========================================================================
 # Command → Engine HTTP dispatch
 # ===========================================================================
+
+def _to_logical(v: float) -> int:
+    """Map a coordinate from image-pixel space to logical-pixel space."""
+    return round(v / _image_scale) if _image_scale != 1.0 else int(v)
+
 
 def dispatch_command(cmd: Command) -> dict[str, Any]:
     """
@@ -288,30 +304,30 @@ def dispatch_command(cmd: Command) -> dict[str, Any]:
         a = args  # ScreenshotArgs
         body: dict[str, Any] = {}
         if a.width is not None:
-            body["width"] = a.width
+            body["width"] = _to_logical(a.width)
         if a.height is not None:
-            body["height"] = a.height
+            body["height"] = _to_logical(a.height)
         if a.top is not None:
-            body["top"] = a.top
+            body["top"] = _to_logical(a.top)
         if a.left is not None:
-            body["left"] = a.left
+            body["left"] = _to_logical(a.left)
         return _engine_post("/screenshot", body)
 
-    # --- Mouse ---
+    # --- Mouse (coordinates remapped from image-pixel to logical) ---
     if tool == "mouse_move":
-        return _engine_post("/mouse", {"action": "move", "x": args.x, "y": args.y})
+        return _engine_post("/mouse", {"action": "move", "x": _to_logical(args.x), "y": _to_logical(args.y)})
     if tool == "mouse_click":
         return _engine_post(
-            "/mouse", {"action": "click", "x": args.x, "y": args.y, "button": args.button}
+            "/mouse", {"action": "click", "x": _to_logical(args.x), "y": _to_logical(args.y), "button": args.button}
         )
     if tool == "mouse_drag":
         return _engine_post(
             "/mouse",
-            {"action": "drag", "x": args.x1, "y": args.y1, "x2": args.x2, "y2": args.y2},
+            {"action": "drag", "x": _to_logical(args.x1), "y": _to_logical(args.y1), "x2": _to_logical(args.x2), "y2": _to_logical(args.y2)},
         )
     if tool == "mouse_scroll":
         return _engine_post(
-            "/mouse", {"action": "scroll", "x": args.x, "y": args.y, "amount": args.amount}
+            "/mouse", {"action": "scroll", "x": _to_logical(args.x), "y": _to_logical(args.y), "amount": args.amount}
         )
 
     # --- Keyboard ---
@@ -388,7 +404,7 @@ Available tools and their argument shapes:
 - run_shell(command, shell?, cwd?, timeout?) — shell: "cmd"|"powershell"; timeout: 1-300s, default 30s
 - list_desktops() / switch_desktop(index) / create_desktop() / delete_desktop(index)
 
-All coordinates are logical pixels.\
+All coordinates are screenshot pixels.\
 """
 
 

@@ -149,6 +149,7 @@ except Exception as exc:  # noqa: BLE001
 # ---------------------------------------------------------------------------
 from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
+import mss  # noqa: E402
 
 from engine.middleware.auth import BearerAuthMiddleware  # noqa: E402
 from engine.routers import (  # noqa: E402
@@ -211,6 +212,26 @@ async def health(request: Request):
 async def reload_dpi():
     new_map = dpi_utils.reload_monitor_map()
     return {"success": True, "data": {"dpi_map": new_map}, "error": None, "timed_out": False}
+
+
+# ---------------------------------------------------------------------------
+# /screen-info
+# ---------------------------------------------------------------------------
+@app.get("/screen-info")
+async def screen_info():
+    monitor_map = dpi_utils.get_monitor_map()
+    # Derive logical virtual-desktop size directly from the monitor map (already in logical coords).
+    # Using per-monitor logical_right/bottom avoids the error of dividing a multi-monitor physical
+    # extent by only the primary DPI scale, which is wrong on mixed-DPI setups.
+    logical_w = max(m["logical_right"] for m in monitor_map) - min(m["logical_left"] for m in monitor_map)
+    logical_h = max(m["logical_bottom"] for m in monitor_map) - min(m["logical_top"] for m in monitor_map)
+    dpi_scale = dpi_utils.get_primary_scale(monitor_map)
+    return {
+        "success": True,
+        "data": {"logical_width": logical_w, "logical_height": logical_h, "dpi_scale": dpi_scale},
+        "error": None,
+        "timed_out": False,
+    }
 
 
 # ---------------------------------------------------------------------------
