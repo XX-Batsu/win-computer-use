@@ -118,10 +118,80 @@ function textContent(text: string): { content: TextContent[] } {
   return { content: [{ type: "text", text }] };
 }
 
+// ── Coordinate remapping ────────────────────────────────────────────────────
+// Screenshots are resized to fit within 1920×1080 for Claude-friendly token usage.
+// imageScale converts image-pixel coords back to logical coords: logical = image / imageScale.
+
+let imageScale = 1.0;
+
+/** Map a coordinate from the (possibly resized) screenshot space to logical pixels. */
+function toLogical(v: number): number {
+  return imageScale === 1.0 ? v : Math.round(v / imageScale);
+}
+
+/** Map a coordinate from logical pixels back to screenshot image space. */
+function toImage(v: number): number {
+  return imageScale === 1.0 ? v : Math.round(v * imageScale);
+}
+
+/** Remap bounding_rect and center in element data from logical → image coords. */
+function remapElementCoords(data: unknown): unknown {
+  if (data === null || typeof data !== "object") return data;
+  if (Array.isArray(data)) return (data as unknown[]).map(remapElementCoords);
+  const obj = data as Record<string, unknown>;
+  const result: Record<string, unknown> = { ...obj };
+  if (obj.center !== null && typeof obj.center === "object") {
+    const c = obj.center as { x: number; y: number };
+    result.center = { x: toImage(c.x), y: toImage(c.y) };
+  }
+  if (obj.bounding_rect !== null && typeof obj.bounding_rect === "object") {
+    const r = obj.bounding_rect as { left: number; top: number; right: number; bottom: number };
+    result.bounding_rect = {
+      left: toImage(r.left),
+      top: toImage(r.top),
+      right: toImage(r.right),
+      bottom: toImage(r.bottom),
+    };
+  }
+  return result;
+}
+
+/** Initialize imageScale at startup from /screen-info. Non-fatal on failure.
+ *  Uses a manual fetch with AbortController timeout instead of engineGet()
+ *  because engineGet() does not support per-call timeouts. */
+async function initImageScale(): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  try {
+    const res = await fetch(`${ENGINE_URL}/screen-info`, {
+      method: "GET",
+      headers: authHeaders(),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    const body = (await res.json()) as EngineResponse<{ logical_width: number; logical_height: number }>;
+    if (body.success) {
+      const { logical_width: lw, logical_height: lh } = body.data;
+      if (lw > 1920 || lh > 1080) {
+        imageScale = Math.min(1920 / lw, 1080 / lh);
+      }
+      console.error(`imageScale initialized: ${imageScale.toFixed(4)} (screen ${lw}×${lh} logical)`);
+    } else {
+      console.error(`WARNING: initImageScale — engine returned success=false: ${body.error ?? "unknown"}`);
+    }
+  } catch (err) {
+    clearTimeout(timer);
+    const msg = (err as Error).name === "AbortError"
+      ? "timed out after 3s"
+      : (err as Error).message;
+    console.error(`WARNING: initImageScale failed (${msg}) — imageScale stays 1.0`);
+  }
+}
+
 // ── Tool definitions ─────────────────────────────────────────────────────────
 
 const COORD_NOTE =
-  "All coordinates are logical pixels (DPI-independent).";
+  "All coordinates are in screenshot pixels (mapped automatically to logical pixels).";
 
 const TOOLS: Tool[] = [
   {
@@ -130,10 +200,10 @@ const TOOLS: Tool[] = [
     inputSchema: {
       type: "object",
       properties: {
-        top: { type: "number", description: "Top edge of capture region in logical pixels" },
-        left: { type: "number", description: "Left edge of capture region in logical pixels" },
-        width: { type: "number", description: "Width of capture region in logical pixels" },
-        height: { type: "number", description: "Height of capture region in logical pixels" },
+        top: { type: "number", description: "Top edge of capture region in screenshot pixels" },
+        left: { type: "number", description: "Left edge of capture region in screenshot pixels" },
+        width: { type: "number", description: "Width of capture region in screenshot pixels" },
+        height: { type: "number", description: "Height of capture region in screenshot pixels" },
       },
     },
   },
@@ -143,8 +213,8 @@ const TOOLS: Tool[] = [
     inputSchema: {
       type: "object",
       properties: {
-        x: { type: "number", description: "X coordinate in logical pixels" },
-        y: { type: "number", description: "Y coordinate in logical pixels" },
+        x: { type: "number", description: "X coordinate in screenshot pixels" },
+        y: { type: "number", description: "Y coordinate in screenshot pixels" },
       },
       required: ["x", "y"],
     },
@@ -155,8 +225,8 @@ const TOOLS: Tool[] = [
     inputSchema: {
       type: "object",
       properties: {
-        x: { type: "number", description: "X coordinate in logical pixels" },
-        y: { type: "number", description: "Y coordinate in logical pixels" },
+        x: { type: "number", description: "X coordinate in screenshot pixels" },
+        y: { type: "number", description: "Y coordinate in screenshot pixels" },
         button: {
           type: "string",
           enum: ["left", "right", "middle"],
@@ -167,15 +237,32 @@ const TOOLS: Tool[] = [
     },
   },
   {
-    name: "mouse_drag",
-    description: `Drag the mouse from (x1, y1) to (x2, y2). Supports cross-window OLE drag-and-drop. ${COORD_NOTE}`,
+    name: "mouse_double_click",
+    description: `Double-click the mouse at (x, y). Use instead of two sequential mouse_click calls to avoid OS double-click threshold issues. ${COORD_NOTE}`,
     inputSchema: {
       type: "object",
       properties: {
-        x1: { type: "number", description: "Start X coordinate in logical pixels" },
-        y1: { type: "number", description: "Start Y coordinate in logical pixels" },
-        x2: { type: "number", description: "End X coordinate in logical pixels" },
-        y2: { type: "number", description: "End Y coordinate in logical pixels" },
+        x: { type: "number", description: "X coordinate in screenshot pixels" },
+        y: { type: "number", description: "Y coordinate in screenshot pixels" },
+        button: {
+          type: "string",
+          enum: ["left", "right", "middle"],
+          description: "Mouse button to double-click (default: left)",
+        },
+      },
+      required: ["x", "y"],
+    },
+  },
+  {
+    name: "mouse_drag",
+    description: `Drag the mouse from (x1, y1) to (x2, y2), optionally via intermediate waypoints. Use waypoints when the path is not a straight line (L-shaped, Z-shaped, curved brush strokes, obstacle avoidance). For simple A→B drags omit waypoints. Supports cross-window OLE drag-and-drop. ${COORD_NOTE}`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        x1: { type: "number", description: "Start X coordinate in screenshot pixels" },
+        y1: { type: "number", description: "Start Y coordinate in screenshot pixels" },
+        x2: { type: "number", description: "End X coordinate in screenshot pixels" },
+        y2: { type: "number", description: "End Y coordinate in screenshot pixels" },
         button: {
           type: "string",
           enum: ["left", "right", "middle"],
@@ -183,9 +270,55 @@ const TOOLS: Tool[] = [
         },
         duration: { type: "number", description: "Total drag movement time in seconds (default 0.5)" },
         hold_before: { type: "number", description: "Delay after mouseDown before moving, for DnD init (default 0.2)" },
-        steps: { type: "integer", description: "Number of interpolation steps (default 20)" },
+        steps: { type: "integer", description: "Number of interpolation steps total across all segments (default 20)" },
+        waypoints: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              x: { type: "number", description: "X coordinate in screenshot pixels" },
+              y: { type: "number", description: "Y coordinate in screenshot pixels" },
+            },
+            required: ["x", "y"],
+          },
+          description: "Optional intermediate waypoints in screenshot pixels. Mouse follows (x1,y1) → waypoints[0] → ... → (x2,y2) without releasing the button. Empty array treated same as omitting.",
+        },
       },
       required: ["x1", "y1", "x2", "y2"],
+    },
+  },
+  {
+    name: "mouse_down",
+    description: `Press and hold a mouse button at (x, y) without releasing. Use only when you need to interleave other operations while the button is held (e.g. screenshot to verify state, keyboard_type, mouse_move to multiple stops). For continuous A→B drags use mouse_drag; for multi-segment paths use mouse_drag with waypoints. Always follow with mouse_up to release. ${COORD_NOTE}`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "number", description: "X coordinate in screenshot pixels" },
+        y: { type: "number", description: "Y coordinate in screenshot pixels" },
+        button: {
+          type: "string",
+          enum: ["left", "right", "middle"],
+          description: "Mouse button to press and hold (default: left)",
+        },
+      },
+      required: ["x", "y"],
+    },
+  },
+  {
+    name: "mouse_up",
+    description: `Release a held mouse button. Always pair with mouse_down. If x and y are both provided, mouse moves to that position before releasing (x and y must be provided together — one without the other is invalid). If neither x nor y is given, releases at the current cursor position. ${COORD_NOTE}`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "number", description: "X coordinate to move to before releasing (optional, must be paired with y)" },
+        y: { type: "number", description: "Y coordinate to move to before releasing (optional, must be paired with x)" },
+        button: {
+          type: "string",
+          enum: ["left", "right", "middle"],
+          description: "Mouse button to release (default: left)",
+        },
+      },
+      required: [],
     },
   },
   {
@@ -194,8 +327,8 @@ const TOOLS: Tool[] = [
     inputSchema: {
       type: "object",
       properties: {
-        x: { type: "number", description: "X coordinate in logical pixels" },
-        y: { type: "number", description: "Y coordinate in logical pixels" },
+        x: { type: "number", description: "X coordinate in screenshot pixels" },
+        y: { type: "number", description: "Y coordinate in screenshot pixels" },
         amount: {
           type: "number",
           description: "Scroll amount (positive = up, negative = down)",
@@ -377,7 +510,8 @@ const TOOLS: Tool[] = [
       "Use this for precise coordinates of small, dense, or hard-to-distinguish elements " +
       "(list items, menu entries, toolbar buttons). Use list_windows first to get the window " +
       "handle, or pass a title substring. Prefer screenshot + visual coordinate picking for " +
-      `large, obvious targets. ${COORD_NOTE}`,
+      "large, obvious targets. Returned element center and bounding_rect are in screenshot pixels. " +
+      `Take a screenshot first to ensure coordinate alignment. ${COORD_NOTE}`,
     inputSchema: {
       type: "object",
       properties: {
@@ -398,13 +532,13 @@ const TOOLS: Tool[] = [
   {
     name: "element_at",
     description:
-      "Identify the UI element at a given logical coordinate. Use after taking a screenshot " +
-      `to understand what a specific UI element is before clicking it. ${COORD_NOTE}`,
+      "Identify the UI element at a given screenshot coordinate. Use after taking a screenshot " +
+      `to understand what a specific UI element is before clicking it. Returned center and bounding_rect are also in screenshot pixels. ${COORD_NOTE}`,
     inputSchema: {
       type: "object",
       properties: {
-        x: { type: "number", description: "X coordinate in logical pixels" },
-        y: { type: "number", description: "Y coordinate in logical pixels" },
+        x: { type: "number", description: "X coordinate in screenshot pixels" },
+        y: { type: "number", description: "Y coordinate in screenshot pixels" },
       },
       required: ["x", "y"],
     },
@@ -425,16 +559,20 @@ async function handleTool(
     switch (name) {
       // ── Screenshot ──────────────────────────────────────────────────────
       case "screenshot": {
+        // Match engine semantics: full_screen = (width is None and height is None)
+        const isCrop = args.width !== undefined && args.height !== undefined;
         const body: Record<string, number> = {};
-        if (args.top !== undefined) body.top = args.top as number;
-        if (args.left !== undefined) body.left = args.left as number;
-        if (args.width !== undefined) body.width = args.width as number;
-        if (args.height !== undefined) body.height = args.height as number;
+        if (args.top !== undefined) body.top = toLogical(args.top as number);
+        if (args.left !== undefined) body.left = toLogical(args.left as number);
+        if (args.width !== undefined) body.width = toLogical(args.width as number);
+        if (args.height !== undefined) body.height = toLogical(args.height as number);
 
         const resp = await enginePost<{
           image: string;
           dpi_scale: number;
+          image_scale: number;
           logical_size: [number, number];
+          image_size: [number, number];
           physical_size: [number, number];
           virtual_origin: unknown;
         }>("/screenshot", body);
@@ -442,9 +580,18 @@ async function handleTool(
           return errorContent(`screenshot failed: ${resp.error ?? "unknown error"}`);
         }
 
+        // Only update imageScale from full-screen shots — cropped shots return scale=1.0 for the crop region
+        if (!isCrop) {
+          imageScale = resp.data.image_scale;
+        }
+
         const [lw, lh] = resp.data.logical_size;
+        const [iw, ih] = resp.data.image_size;
         const [pw, ph] = resp.data.physical_size;
-        const meta = `Screenshot: ${lw}\u00d7${lh} logical, ${pw}\u00d7${ph} physical, DPI scale ${resp.data.dpi_scale}`;
+        const meta =
+          `Screenshot: ${iw}\u00d7${ih} image pixels (logical ${lw}\u00d7${lh}, physical ${pw}\u00d7${ph}, ` +
+          `DPI scale ${resp.data.dpi_scale}, image scale ${resp.data.image_scale.toFixed(4)}). ` +
+          `Use coordinates from this image directly — they are remapped automatically.`;
 
         const metaContent: TextContent = { type: "text", text: meta };
         const imageContent: ImageContent = {
@@ -459,8 +606,8 @@ async function handleTool(
       case "mouse_move": {
         const resp = await enginePost("/mouse", {
           action: "move",
-          x: args.x,
-          y: args.y,
+          x: toLogical(args.x as number),
+          y: toLogical(args.y as number),
         });
         if (!resp.success) return errorContent(`mouse_move failed: ${resp.error}`);
         return textContent("Mouse moved.");
@@ -469,36 +616,78 @@ async function handleTool(
       case "mouse_click": {
         const resp = await enginePost("/mouse", {
           action: "click",
-          x: args.x,
-          y: args.y,
+          x: toLogical(args.x as number),
+          y: toLogical(args.y as number),
           button: args.button ?? "left",
         });
         if (!resp.success) return errorContent(`mouse_click failed: ${resp.error}`);
         return textContent("Mouse clicked.");
       }
 
+      case "mouse_double_click": {
+        const resp = await enginePost("/mouse", {
+          action: "double_click",
+          x: toLogical(args.x as number),
+          y: toLogical(args.y as number),
+          button: args.button ?? "left",
+        });
+        if (!resp.success) return errorContent(`mouse_double_click failed: ${resp.error}`);
+        return textContent("Mouse double-clicked.");
+      }
+
       case "mouse_drag": {
         const body: Record<string, unknown> = {
           action: "drag",
-          x: args.x1,
-          y: args.y1,
-          x2: args.x2,
-          y2: args.y2,
+          x: toLogical(args.x1 as number),
+          y: toLogical(args.y1 as number),
+          x2: toLogical(args.x2 as number),
+          y2: toLogical(args.y2 as number),
         };
         if (args.button !== undefined) body.button = args.button;
         if (args.duration !== undefined) body.duration = args.duration;
         if (args.hold_before !== undefined) body.hold_before = args.hold_before;
         if (args.steps !== undefined) body.steps = args.steps;
+        if (args.waypoints !== undefined) {
+          body.waypoints = (args.waypoints as Array<{ x: number; y: number }>).map(wp => ({
+            x: toLogical(wp.x),
+            y: toLogical(wp.y),
+          }));
+        }
         const resp = await enginePost("/mouse", body);
         if (!resp.success) return errorContent(`mouse_drag failed: ${resp.error}`);
         return textContent("Mouse dragged.");
       }
 
+      case "mouse_down": {
+        const resp = await enginePost("/mouse", {
+          action: "mousedown",
+          x: toLogical(args.x as number),
+          y: toLogical(args.y as number),
+          button: args.button ?? "left",
+        });
+        if (!resp.success) return errorContent(`mouse_down failed: ${resp.error}`);
+        return textContent("Mouse button pressed.");
+      }
+
+      case "mouse_up": {
+        const body: Record<string, unknown> = {
+          action: "mouseup",
+          button: args.button ?? "left",
+        };
+        if (args.x !== undefined && args.y !== undefined) {
+          body.x = toLogical(args.x as number);
+          body.y = toLogical(args.y as number);
+        }
+        const resp = await enginePost("/mouse", body);
+        if (!resp.success) return errorContent(`mouse_up failed: ${resp.error}`);
+        return textContent("Mouse button released.");
+      }
+
       case "mouse_scroll": {
         const resp = await enginePost("/mouse", {
           action: "scroll",
-          x: args.x,
-          y: args.y,
+          x: toLogical(args.x as number),
+          y: toLogical(args.y as number),
           amount: args.amount,
         });
         if (!resp.success) return errorContent(`mouse_scroll failed: ${resp.error}`);
@@ -632,17 +821,17 @@ async function handleTool(
         if (args.timeout !== undefined) body.timeout = args.timeout;
         const resp = await enginePost<unknown>("/find_element", body);
         if (!resp.success) return errorContent(`find_element failed: ${resp.error}`);
-        return textContent(JSON.stringify(resp.data, null, 2));
+        return textContent(JSON.stringify(remapElementCoords(resp.data), null, 2));
       }
 
       case "element_at": {
         const resp = await enginePost<unknown>("/element_at", {
-          x: args.x,
-          y: args.y,
+          x: toLogical(args.x as number),
+          y: toLogical(args.y as number),
         });
         if (!resp.success) return errorContent(`element_at failed: ${resp.error}`);
         if (resp.data === null) return textContent(resp.error ?? "No element found at this coordinate.");
-        return textContent(JSON.stringify(resp.data, null, 2));
+        return textContent(JSON.stringify(remapElementCoords(resp.data), null, 2));
       }
 
       default:
@@ -675,5 +864,6 @@ if (!ENGINE_SECRET) {
   console.error("WARNING: ENGINE_SECRET is not set. All requests to the engine will fail with 401.");
 }
 
+await initImageScale();
 const transport = new StdioServerTransport();
 await server.connect(transport);
