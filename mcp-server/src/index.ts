@@ -168,7 +168,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "mouse_drag",
-    description: `Drag the mouse from (x1, y1) to (x2, y2). ${COORD_NOTE}`,
+    description: `Drag the mouse from (x1, y1) to (x2, y2). Supports cross-window OLE drag-and-drop. ${COORD_NOTE}`,
     inputSchema: {
       type: "object",
       properties: {
@@ -176,6 +176,14 @@ const TOOLS: Tool[] = [
         y1: { type: "number", description: "Start Y coordinate in logical pixels" },
         x2: { type: "number", description: "End X coordinate in logical pixels" },
         y2: { type: "number", description: "End Y coordinate in logical pixels" },
+        button: {
+          type: "string",
+          enum: ["left", "right", "middle"],
+          description: "Mouse button to use for dragging (default: left)",
+        },
+        duration: { type: "number", description: "Total drag movement time in seconds (default 0.5)" },
+        hold_before: { type: "number", description: "Delay after mouseDown before moving, for DnD init (default 0.2)" },
+        steps: { type: "integer", description: "Number of interpolation steps (default 20)" },
       },
       required: ["x1", "y1", "x2", "y2"],
     },
@@ -423,19 +431,28 @@ async function handleTool(
         if (args.width !== undefined) body.width = args.width as number;
         if (args.height !== undefined) body.height = args.height as number;
 
-        const resp = await enginePost<{ image: string; dpi_scale: number; virtual_origin: unknown }>(
-          "/screenshot",
-          body
-        );
+        const resp = await enginePost<{
+          image: string;
+          dpi_scale: number;
+          logical_size: [number, number];
+          physical_size: [number, number];
+          virtual_origin: unknown;
+        }>("/screenshot", body);
         if (!resp.success) {
           return errorContent(`screenshot failed: ${resp.error ?? "unknown error"}`);
         }
+
+        const [lw, lh] = resp.data.logical_size;
+        const [pw, ph] = resp.data.physical_size;
+        const meta = `Screenshot: ${lw}\u00d7${lh} logical, ${pw}\u00d7${ph} physical, DPI scale ${resp.data.dpi_scale}`;
+
+        const metaContent: TextContent = { type: "text", text: meta };
         const imageContent: ImageContent = {
           type: "image",
           data: resp.data.image,
           mimeType: "image/png",
         };
-        return { content: [imageContent] };
+        return { content: [metaContent, imageContent] };
       }
 
       // ── Mouse ────────────────────────────────────────────────────────────
@@ -461,13 +478,18 @@ async function handleTool(
       }
 
       case "mouse_drag": {
-        const resp = await enginePost("/mouse", {
+        const body: Record<string, unknown> = {
           action: "drag",
           x: args.x1,
           y: args.y1,
           x2: args.x2,
           y2: args.y2,
-        });
+        };
+        if (args.button !== undefined) body.button = args.button;
+        if (args.duration !== undefined) body.duration = args.duration;
+        if (args.hold_before !== undefined) body.hold_before = args.hold_before;
+        if (args.steps !== undefined) body.steps = args.steps;
+        const resp = await enginePost("/mouse", body);
         if (!resp.success) return errorContent(`mouse_drag failed: ${resp.error}`);
         return textContent("Mouse dragged.");
       }
@@ -619,7 +641,7 @@ async function handleTool(
           y: args.y,
         });
         if (!resp.success) return errorContent(`element_at failed: ${resp.error}`);
-        if (resp.data === null) return textContent("No element found at this coordinate.");
+        if (resp.data === null) return textContent(resp.error ?? "No element found at this coordinate.");
         return textContent(JSON.stringify(resp.data, null, 2));
       }
 

@@ -84,6 +84,9 @@ async def take_screenshot(req: ScreenshotRequest):
             # Convert mss ScreenShot → PIL Image (physical pixels)
             img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
 
+            # Record physical size before downscaling (for P3 metadata)
+            physical_size = (img.width, img.height)
+
             # P0: Downscale to logical size so pixel coords = logical coords
             if dpi_scale != 1.0:
                 logical_size = (round(img.width / dpi_scale), round(img.height / dpi_scale))
@@ -98,6 +101,8 @@ async def take_screenshot(req: ScreenshotRequest):
             "data": {
                 "image": b64,
                 "dpi_scale": dpi_scale,
+                "logical_size": [img.width, img.height],
+                "physical_size": list(physical_size),
                 "virtual_origin": virtual_origin,
             },
             "error": None,

@@ -9,7 +9,7 @@ import asyncio
 import logging
 import re
 import time
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
@@ -27,7 +27,7 @@ _pywinauto_available = False
 _pywinauto_error = ""
 
 try:
-    from pywinauto import Application, Desktop
+    from pywinauto import Application
     from pywinauto.findwindows import ElementNotFoundError
     from pywinauto.uia_element_info import UIAElementInfo
     import pywinauto.findwindows as findwindows

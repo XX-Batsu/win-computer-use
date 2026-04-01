@@ -6,11 +6,13 @@ All input coordinates are logical pixels; converted to physical before calling
 pyautogui (which operates in physical pixel space).
 """
 
+import asyncio
+import time
 from typing import Literal, Optional
 
 import pyautogui
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from engine import dpi_utils
 
@@ -25,6 +27,10 @@ class MouseRequest(BaseModel):
     x2: Optional[int] = None
     y2: Optional[int] = None
     amount: Optional[int] = None
+    # Drag-specific parameters (ignored for other actions)
+    duration: float = Field(0.5, ge=0.0, le=10.0)
+    hold_before: float = Field(0.2, ge=0.0, le=5.0)
+    steps: int = Field(20, ge=1, le=200)
 
 
 @router.post("/mouse")
@@ -61,8 +67,24 @@ async def mouse_action(req: MouseRequest):
                     "timed_out": False,
                 }
             phys_x2, phys_y2, _ = dpi_utils.logical_to_physical(req.x2, req.y2, monitor_map)
-            pyautogui.moveTo(phys_x, phys_y)
-            pyautogui.dragTo(phys_x2, phys_y2, duration=0.25, button=req.button or "left")
+            button = req.button or "left"
+
+            def _execute_drag():
+                pyautogui.moveTo(phys_x, phys_y)
+                pyautogui.mouseDown(button=button)
+                time.sleep(req.hold_before)
+
+                for i in range(1, req.steps + 1):
+                    t = i / req.steps
+                    ix = phys_x + (phys_x2 - phys_x) * t
+                    iy = phys_y + (phys_y2 - phys_y) * t
+                    pyautogui.moveTo(int(ix), int(iy))
+                    time.sleep(req.duration / req.steps)
+
+                time.sleep(0.1)
+                pyautogui.mouseUp(button=button)
+
+            await asyncio.to_thread(_execute_drag)
             return {
                 "success": True,
                 "data": {
