@@ -18,12 +18,14 @@ Security model / trust boundary:
 - cwd is validated to be an existing absolute path.
 """
 
+import asyncio
 import os
 import re
 import subprocess
 from typing import Dict, Literal, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 router = APIRouter()
@@ -34,6 +36,7 @@ router = APIRouter()
 _ENV_DENYLIST = {
     "APPDATA",
     "COMSPEC",
+    "ENGINE_SECRET",
     "LOCALAPPDATA",
     "NODE_OPTIONS",
     "PATH",
@@ -69,9 +72,9 @@ async def run_shell(req: ShellRequest):
         # Validate env_extra keys: allowlist pattern first, then denylist.
         invalid_pattern = [k for k in env_extra if not _ENV_KEY_PATTERN.match(k)]
         if invalid_pattern:
-            raise HTTPException(
+            return JSONResponse(
                 status_code=400,
-                detail={
+                content={
                     "success": False,
                     "data": None,
                     "error": (
@@ -84,9 +87,9 @@ async def run_shell(req: ShellRequest):
 
         blocked = _ENV_DENYLIST.intersection(env_extra.keys())
         if blocked:
-            raise HTTPException(
+            return JSONResponse(
                 status_code=400,
-                detail={
+                content={
                     "success": False,
                     "data": None,
                     "error": f"env_extra contains blocked keys: {sorted(blocked)}",
@@ -121,7 +124,8 @@ async def run_shell(req: ShellRequest):
         else:
             cmd_list = ["cmd", "/c", req.command]
 
-        result = subprocess.run(
+        result = await asyncio.to_thread(
+            subprocess.run,
             cmd_list,
             capture_output=True,
             text=True,
@@ -143,10 +147,11 @@ async def run_shell(req: ShellRequest):
         }
 
     except subprocess.TimeoutExpired as exc:
-        if exc.process is not None:
+        proc = getattr(exc, "process", None)
+        if proc is not None:
             try:
-                exc.process.kill()
-                exc.process.communicate()  # 清理 pipe buffer
+                proc.kill()
+                proc.communicate()  # flush pipe buffers
             except OSError:
                 pass
         return {
@@ -155,8 +160,6 @@ async def run_shell(req: ShellRequest):
             "error": "operation timed out",
             "timed_out": True,
         }
-    except HTTPException:
-        raise
     except Exception as e:  # noqa: BLE001
         return {
             "success": False,

@@ -23,6 +23,43 @@ router = APIRouter()
 
 KEYBOARD_TIMEOUT = 30  # seconds
 
+# ---------------------------------------------------------------------------
+# Held-key tracking — detect orphaned keydown without matching keyup
+# ---------------------------------------------------------------------------
+_held_keys: set[str] = set()
+
+
+def get_held_keys() -> set[str]:
+    """Return the set of currently held keys."""
+    return set(_held_keys)
+
+
+def release_all_held_keys() -> list[str]:
+    """Release all held keys via subprocess workers. Returns keys released."""
+    released = []
+    for key in list(_held_keys):
+        q: multiprocessing.Queue = multiprocessing.Queue()
+        try:
+            proc = multiprocessing.Process(
+                target=kw_module.keyboard_worker,
+                args=(q, "keyup", {"key": key}),
+            )
+            proc.start()
+            proc.join(5)
+            if proc.is_alive():
+                proc.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                q.close()
+                q.join_thread()
+            except Exception:  # noqa: BLE001
+                pass
+        released.append(key)
+    _held_keys.clear()
+    return released
+
 
 class KeyboardRequest(BaseModel):
     action: Literal["type", "hotkey", "keydown", "keyup"]
@@ -48,10 +85,11 @@ def _build_args(req: KeyboardRequest) -> Dict[str, Any]:
 
 @router.post("/keyboard")
 async def keyboard_action(req: KeyboardRequest):
+    q: multiprocessing.Queue | None = None
     try:
         args = _build_args(req)
 
-        q: multiprocessing.Queue = multiprocessing.Queue()
+        q = multiprocessing.Queue()
         proc = multiprocessing.Process(
             target=kw_module.keyboard_worker,
             args=(q, req.action, args),
@@ -83,6 +121,14 @@ async def keyboard_action(req: KeyboardRequest):
             result = q.get_nowait()
         except _queue.Empty:
             result = {"success": False, "error": "worker exited without result", "timed_out": False}
+
+        # Track held-key state on success
+        if result.get("success"):
+            if req.action == "keydown" and req.key:
+                _held_keys.add(req.key)
+            elif req.action == "keyup" and req.key:
+                _held_keys.discard(req.key)
+
         return result
 
     except Exception as e:  # noqa: BLE001
@@ -92,3 +138,10 @@ async def keyboard_action(req: KeyboardRequest):
             "error": str(e),
             "timed_out": False,
         }
+    finally:
+        if q is not None:
+            try:
+                q.close()
+                q.join_thread()
+            except Exception:  # noqa: BLE001
+                pass

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import subprocess
 import sys
 import time
@@ -51,7 +50,7 @@ logger = logging.getLogger("scheduler")
 if str(SCHEDULER_DIR) not in sys.path:
     sys.path.insert(0, str(SCHEDULER_DIR))
 
-from run import load_tasks, sanitize_name  # noqa: E402
+from run import load_tasks  # noqa: E402
 from protocol import TaskDefinition  # noqa: E402
 
 

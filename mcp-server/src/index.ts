@@ -16,7 +16,6 @@ import {
   toLogicalPos,
   toLogicalDimCoord,
   toImageCoord,
-  toImageDimCoord,
 } from "./coords.js";
 
 // ── Config resolution ────────────────────────────────────────────────────────
@@ -75,6 +74,10 @@ async function engineGet<T>(path: string): Promise<EngineResponse<T>> {
   if (res.status === 401) {
     throw new Error("Engine returned 401 Unauthorized — check ENGINE_SECRET");
   }
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Engine returned HTTP ${res.status}: ${text}`);
+  }
   return (await res.json()) as EngineResponse<T>;
 }
 
@@ -95,6 +98,10 @@ async function enginePost<T>(
   if (res.status === 401) {
     throw new Error("Engine returned 401 Unauthorized — check ENGINE_SECRET");
   }
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Engine returned HTTP ${res.status}: ${text}`);
+  }
   return (await res.json()) as EngineResponse<T>;
 }
 
@@ -110,6 +117,10 @@ async function engineDelete<T>(path: string): Promise<EngineResponse<T>> {
   }
   if (res.status === 401) {
     throw new Error("Engine returned 401 Unauthorized — check ENGINE_SECRET");
+  }
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Engine returned HTTP ${res.status}: ${text}`);
   }
   return (await res.json()) as EngineResponse<T>;
 }
@@ -150,29 +161,31 @@ function toLogicalDim(v: number): number { return toLogicalDimCoord(v, currentIm
 function toImageCurrentX(v: number): number { return toImageCoord(v, currentImageScale, cropOffsetX); }
 /** Logical Y → current screenshot image pixels. */
 function toImageCurrentY(v: number): number { return toImageCoord(v, currentImageScale, cropOffsetY); }
-/** Logical dimension → current screenshot image pixels. */
-function toImageCurrentDim(v: number): number { return toImageDimCoord(v, currentImageScale); }
 
-/** Remap bounding_rect and center in element data from logical → current-screenshot image coords. */
+
+/** Remap bounding_rect and center in element data from logical → current-screenshot image coords.
+ *  Recurses into all object properties so nested structures (e.g. find_element's
+ *  {elements: [{center, bounding_rect}, ...]} ) are correctly transformed. */
 function remapElementCoords(data: unknown): unknown {
   if (data === null || typeof data !== "object") return data;
   if (Array.isArray(data)) return (data as unknown[]).map(remapElementCoords);
   const obj = data as Record<string, unknown>;
-  const result: Record<string, unknown> = { ...obj };
-  if (obj.center !== null && typeof obj.center === "object") {
-    const c = obj.center as { x: number; y: number };
-    result.center = { x: toImageCurrentX(c.x), y: toImageCurrentY(c.y) };
-  }
-  if (obj.bounding_rect !== null && typeof obj.bounding_rect === "object") {
-    const r = obj.bounding_rect as { left: number; top: number; right: number; bottom: number; width?: number; height?: number };
-    result.bounding_rect = {
-      left:   toImageCurrentX(r.left),
-      top:    toImageCurrentY(r.top),
-      right:  toImageCurrentX(r.right),
-      bottom: toImageCurrentY(r.bottom),
-      ...(r.width  !== undefined && { width:  toImageCurrentDim(r.width)  }),
-      ...(r.height !== undefined && { height: toImageCurrentDim(r.height) }),
-    };
+  const result: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(obj)) {
+    if (key === "center" && val !== null && typeof val === "object" && !Array.isArray(val)) {
+      const c = val as { x: number; y: number };
+      result.center = { x: toImageCurrentX(c.x), y: toImageCurrentY(c.y) };
+    } else if (key === "bounding_rect" && val !== null && typeof val === "object" && !Array.isArray(val)) {
+      const r = val as { left: number; top: number; right: number; bottom: number };
+      result.bounding_rect = {
+        left:   toImageCurrentX(r.left),
+        top:    toImageCurrentY(r.top),
+        right:  toImageCurrentX(r.right),
+        bottom: toImageCurrentY(r.bottom),
+      };
+    } else {
+      result[key] = remapElementCoords(val);
+    }
   }
   return result;
 }
@@ -193,7 +206,7 @@ async function initImageScale(): Promise<void> {
     const body = (await res.json()) as EngineResponse<{ logical_width: number; logical_height: number }>;
     if (body.success) {
       const { logical_width: lw, logical_height: lh } = body.data;
-      if (lw > SCREENSHOT_MAX_W || lh > SCREENSHOT_MAX_H) {
+      if (lw > 0 && lh > 0 && (lw > SCREENSHOT_MAX_W || lh > SCREENSHOT_MAX_H)) {
         imageScale = Math.min(SCREENSHOT_MAX_W / lw, SCREENSHOT_MAX_H / lh);
       }
       currentImageScale = imageScale;
@@ -213,16 +226,22 @@ async function initImageScale(): Promise<void> {
 // ── Tool definitions ─────────────────────────────────────────────────────────
 
 const COORD_NOTE =
-  "All coordinates are in screenshot pixels (mapped automatically to logical pixels).";
+  "All coordinates are in screenshot pixels (mapped automatically to logical pixels). " +
+  "IMPORTANT: coordinates are only valid from the most recent screenshot — any new " +
+  "screenshot (including crops and zooms) invalidates coordinates from earlier screenshots.";
 
 export const TOOLS: Tool[] = [
   {
     name: "screenshot",
     description:
       "Capture a screenshot of the screen or a region. " +
-      "Take a full-screen screenshot first to orient yourself, then take crop screenshots of the " +
-      "specific region you need to interact with — crops provide higher effective resolution and " +
-      "reduce token usage. Coordinates from any screenshot (full-screen or crop) can be passed " +
+      "If you haven't seen the screen recently, take a full-screen screenshot to orient yourself, " +
+      "then take crop screenshots of the specific region you need to interact with — crops provide " +
+      "higher effective resolution and reduce token usage. " +
+      "Omit all parameters for full-screen. To crop, provide top, left, width, and height together " +
+      "(width and height must both be provided or both omitted; providing one without the other returns an error). " +
+      "(top/left without width/height are ignored and result in a full-screen capture). " +
+      "Coordinates from the most recent screenshot (whether full-screen or crop) can be passed " +
       "directly to mouse and keyboard tools; the MCP layer remaps them automatically. " +
       COORD_NOTE,
     inputSchema: {
@@ -240,6 +259,9 @@ export const TOOLS: Tool[] = [
     description:
       "Crop a close-up screenshot region centered at (x, y). No upscaling — returns\n" +
       "the cropped area at its original screen resolution.\n\n" +
+      "WARNING: calling this tool changes the active coordinate context. All subsequent\n" +
+      "mouse/keyboard coordinate inputs must come from THIS zoom image, not from any\n" +
+      "prior screenshot. To return to full-screen coordinates, take a new full-screen screenshot.\n\n" +
       "Use after element_at returns no useful element — game UI, images, canvas,\n" +
       "web pages, map coordinates. Gives a close-up pixel-level view of a single target.\n\n" +
       "Use width/height to control the crop area (default 200×200 screenshot pixels).\n" +
@@ -263,7 +285,10 @@ export const TOOLS: Tool[] = [
   {
     name: "screenshot_annotate",
     description:
-      "Take a screenshot with coordinate markers drawn on it.\n\n" +
+      "VERIFICATION ONLY — does NOT change the active coordinate context.\n\n" +
+      "Take a screenshot with coordinate markers drawn on it.\n" +
+      "Coordinates passed to mouse/keyboard tools must still come from the last screenshot\n" +
+      "or screenshot_zoom call, not from this annotated image.\n\n" +
       "Best for: verifying multiple coordinates at once, or when you need to see\n" +
       "where a point falls within the full-screen context. Prefer screenshot_zoom\n" +
       "for isolated single-target close-up verification.\n\n" +
@@ -272,6 +297,9 @@ export const TOOLS: Tool[] = [
       "- \"circle\": hollow circle only — use if crosshair lines obscure important content\n" +
       "- \"both\": crosshair + circle — use when extra visual confirmation is needed\n\n" +
       "Supports optional crop region (same as screenshot tool).\n" +
+      "If you use a crop with this tool, the returned image's pixel coordinates are NOT usable\n" +
+      "for mouse actions — take a regular screenshot crop of the same region if you need\n" +
+      "actionable coordinates.\n\n" +
       "Returns skipped_annotations with the indices of any annotations outside the image bounds.\n" +
       "If skipped_annotations is non-empty, those coordinates were off-screen or outside the\n" +
       "crop region — re-check the coordinates before acting on them.",
@@ -383,7 +411,7 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "mouse_down",
-    description: `Press and hold a mouse button at (x, y) without releasing. Use only when you need to interleave other operations while the button is held (e.g. screenshot to verify state, keyboard_type, mouse_move to multiple stops). For continuous A→B drags use mouse_drag; for multi-segment paths use mouse_drag with waypoints. Always follow with mouse_up to release. ${COORD_NOTE}`,
+    description: `Press and hold a mouse button at (x, y) without releasing. Use only when you need to interleave other operations while the button is held (e.g. screenshot to verify state, keyboard_type, mouse_move to multiple stops). For continuous A→B drags use mouse_drag; for multi-segment paths use mouse_drag with waypoints. CRITICAL: if you do not call mouse_up, the button remains held indefinitely and all subsequent mouse operations will behave as drags. Always follow with mouse_up to release. ${COORD_NOTE}`,
     inputSchema: {
       type: "object",
       properties: {
@@ -417,15 +445,15 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "mouse_scroll",
-    description: `Scroll the mouse wheel at (x, y). Positive amount scrolls up, negative scrolls down. ${COORD_NOTE}`,
+    description: `Scroll the mouse wheel at (x, y). amount is in wheel notches (integer): positive scrolls up, negative scrolls down. 3 notches ≈ one page in most apps. ${COORD_NOTE}`,
     inputSchema: {
       type: "object",
       properties: {
         x: { type: "number", description: "X coordinate in screenshot pixels" },
         y: { type: "number", description: "Y coordinate in screenshot pixels" },
         amount: {
-          type: "number",
-          description: "Scroll amount (positive = up, negative = down)",
+          type: "integer",
+          description: "Scroll wheel notches (integer): positive = up, negative = down",
         },
       },
       required: ["x", "y", "amount"],
@@ -433,7 +461,14 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "keyboard_type",
-    description: "Type text using the keyboard.",
+    description:
+      "Type literal text characters using the keyboard. " +
+      "Text is sent to the currently focused window/control — click on the target input field first " +
+      "to ensure it has focus before calling this tool. " +
+      "ASCII characters are typed as individual keystrokes; non-ASCII characters (accented letters, CJK, emoji) " +
+      "are automatically pasted via the clipboard (WARNING: this overwrites the current clipboard contents). " +
+      "For special keys (Enter, Tab, Escape, arrows) or modifier combos (Ctrl+C), use keyboard_hotkey instead — " +
+      "this tool types literal characters only, not key names.",
     inputSchema: {
       type: "object",
       properties: {
@@ -448,7 +483,10 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "keyboard_hotkey",
-    description: 'Press a keyboard hotkey combination, e.g. ["ctrl", "c"] for copy.',
+    description:
+      'Press a keyboard hotkey combination, e.g. ["ctrl", "c"] for copy. ' +
+      'Also use for single special keys: ["enter"], ["tab"], ["escape"], ["backspace"], ["delete"], arrow keys, etc. ' +
+      'Key names follow pyautogui conventions: ctrl, alt, shift, win, enter, tab, escape, backspace, delete, space, up, down, left, right, f1-f12, home, end, pageup, pagedown, insert, etc.',
     inputSchema: {
       type: "object",
       properties: {
@@ -463,18 +501,23 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "keydown",
-    description: "Press and hold a key.",
+    description:
+      "Press and hold a key without releasing. Key names follow pyautogui conventions " +
+      "(e.g., 'shift', 'ctrl', 'alt', 'win'). Always follow with keyup for the same key to avoid " +
+      "leaving keys stuck. Use keyboard_hotkey for simple combos — keydown/keyup is only needed when " +
+      "you must hold a key across multiple other operations (e.g., Shift+click on several items).",
     inputSchema: {
       type: "object",
       properties: {
-        key: { type: "string", description: "Key name to press and hold" },
+        key: { type: "string", description: "Key name to press and hold (e.g., 'shift', 'ctrl', 'alt')" },
       },
       required: ["key"],
     },
   },
   {
     name: "keyup",
-    description: "Release a held key.",
+    description:
+      "Release a held key. Must always be paired with a prior keydown call for the same key.",
     inputSchema: {
       type: "object",
       properties: {
@@ -540,7 +583,10 @@ export const TOOLS: Tool[] = [
   {
     name: "run_shell",
     description:
-      "Run a shell command and return its output. Timeout is 1–300 seconds (default 30).",
+      "Run a shell command and return its output. Default shell is cmd; pass shell='powershell' " +
+      "for PowerShell commands. Use PowerShell for complex tasks (JSON parsing, regex, object pipelines). " +
+      "Timeout is 1–300 seconds (default 30). Output is returned in full — pipe to findstr (cmd) or " +
+      "Select-String (powershell) to filter large outputs.",
     inputSchema: {
       type: "object",
       properties: {
@@ -554,6 +600,11 @@ export const TOOLS: Tool[] = [
         timeout: {
           type: "number",
           description: "Timeout in seconds (1–300, default 30)",
+        },
+        env_extra: {
+          type: "object",
+          additionalProperties: { type: "string" },
+          description: "Extra environment variables to set for the command (keys must be UPPER_CASE, some system keys are blocked)",
         },
       },
       required: ["command"],
@@ -601,9 +652,10 @@ export const TOOLS: Tool[] = [
     name: "find_element",
     description:
       "Search for UI elements by name, type, or automation ID within a window. " +
-      "Use this for precise coordinates of small, dense, or hard-to-distinguish elements " +
-      "(list items, menu entries, toolbar buttons). Use list_windows first to get the window " +
-      "handle, or pass a title substring. Prefer screenshot + visual coordinate picking for " +
+      "Requires at least one target (hwnd or title) and at least one filter (name, control_type, " +
+      "or automation_id). Use this for precise coordinates of small, dense, or hard-to-distinguish " +
+      "elements (list items, menu entries, toolbar buttons). Use list_windows first to get the " +
+      "window handle, or pass a title substring. Prefer screenshot + visual coordinate picking for " +
       "large, obvious targets. Returned element center and bounding_rect are in screenshot pixels. " +
       `Take a screenshot first to ensure coordinate alignment. ${COORD_NOTE}`,
     inputSchema: {
@@ -896,11 +948,16 @@ export async function handleTool(
       }
 
       case "mouse_up": {
+        const hasX = args.x !== undefined;
+        const hasY = args.y !== undefined;
+        if (hasX !== hasY) {
+          return errorContent("mouse_up: x and y must be provided together — one without the other is invalid.");
+        }
         const body: Record<string, unknown> = {
           action: "mouseup",
           button: args.button ?? "left",
         };
-        if (args.x !== undefined && args.y !== undefined) {
+        if (hasX && hasY) {
           body.x = toLogicalX(args.x as number);
           body.y = toLogicalY(args.y as number);
         }
@@ -1002,6 +1059,7 @@ export async function handleTool(
         if (args.shell !== undefined) body.shell = args.shell;
         if (args.cwd !== undefined) body.cwd = args.cwd;
         if (args.timeout !== undefined) body.timeout = args.timeout;
+        if (args.env_extra !== undefined) body.env_extra = args.env_extra;
         const resp = await enginePost<unknown>("/shell", body);
         if (!resp.success) return errorContent(`run_shell failed: ${resp.error}`);
         return textContent(
@@ -1023,9 +1081,9 @@ export async function handleTool(
       }
 
       case "create_desktop": {
-        const resp = await enginePost<{ index: number }>("/desktop/create", {});
+        const resp = await enginePost<{ new_index: number | null }>("/desktop/create", {});
         if (!resp.success) return errorContent(`create_desktop failed: ${resp.error}`);
-        return textContent(`Created desktop at index ${String(resp.data?.index ?? "unknown")}.`);
+        return textContent(`Created desktop at index ${String(resp.data?.new_index ?? "unknown")}.`);
       }
 
       case "delete_desktop": {

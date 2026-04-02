@@ -9,7 +9,7 @@ pyautogui (which operates in physical pixel space).
 import asyncio
 import math
 import time
-from typing import Dict, List, Literal, Optional
+from typing import List, Literal, Optional
 
 import pyautogui
 from fastapi import APIRouter
@@ -18,6 +18,34 @@ from pydantic import BaseModel, Field
 from engine import dpi_utils
 
 router = APIRouter()
+
+# ---------------------------------------------------------------------------
+# Held-state tracking — lets callers detect orphaned mousedown
+# ---------------------------------------------------------------------------
+_held_buttons: set[str] = set()
+
+
+def get_held_buttons() -> set[str]:
+    """Return the set of currently held mouse buttons."""
+    return set(_held_buttons)
+
+
+def release_all_held() -> list[str]:
+    """Release all held mouse buttons. Returns the list of buttons released."""
+    released = []
+    for btn in list(_held_buttons):
+        try:
+            pyautogui.mouseUp(button=btn)
+        except Exception:  # noqa: BLE001
+            pass
+        released.append(btn)
+    _held_buttons.clear()
+    return released
+
+
+class Waypoint(BaseModel):
+    x: int
+    y: int
 
 
 class MouseRequest(BaseModel):
@@ -32,7 +60,7 @@ class MouseRequest(BaseModel):
     duration: float = Field(0.5, ge=0.0, le=10.0)
     hold_before: float = Field(0.2, ge=0.0, le=5.0)
     steps: int = Field(20, ge=1, le=200)
-    waypoints: Optional[List[Dict[str, int]]] = None
+    waypoints: Optional[List[Waypoint]] = None
 
 
 @router.post("/mouse")
@@ -93,7 +121,7 @@ async def mouse_action(req: MouseRequest):
                 logical_points: List[tuple] = [(req.x, req.y)]
                 if req.waypoints:
                     for wp in req.waypoints:
-                        logical_points.append((wp["x"], wp["y"]))
+                        logical_points.append((wp.x, wp.y))
                 logical_points.append((req.x2, req.y2))
 
                 # Convert all points to physical coords
@@ -161,6 +189,7 @@ async def mouse_action(req: MouseRequest):
             button = req.button or "left"
             pyautogui.moveTo(phys_x, phys_y)
             pyautogui.mouseDown(button=button)
+            _held_buttons.add(button)
             return {
                 "success": True,
                 "data": {"pressed_at": {"x": phys_x, "y": phys_y}, "button": button},
@@ -169,11 +198,15 @@ async def mouse_action(req: MouseRequest):
             }
 
         elif req.action == "mouseup":
+            # Validate: x and y must both be present or both absent
+            if (req.x is None) != (req.y is None):
+                return {"success": False, "data": None, "error": "mouseup: x and y must be provided together", "timed_out": False}
             button = req.button or "left"
             if req.x is not None and req.y is not None:
                 phys_x, phys_y, _ = dpi_utils.logical_to_physical(req.x, req.y, monitor_map)
                 pyautogui.moveTo(phys_x, phys_y)
             pyautogui.mouseUp(button=button)
+            _held_buttons.discard(button)
             return {
                 "success": True,
                 "data": {"button": button},

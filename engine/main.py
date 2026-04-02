@@ -149,7 +149,6 @@ except Exception as exc:  # noqa: BLE001
 # ---------------------------------------------------------------------------
 from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
-import mss  # noqa: E402
 
 from engine.middleware.auth import BearerAuthMiddleware  # noqa: E402
 from engine.routers import (  # noqa: E402
@@ -229,6 +228,23 @@ async def screen_info():
     return {
         "success": True,
         "data": {"logical_width": logical_w, "logical_height": logical_h, "dpi_scale": dpi_scale},
+        "error": None,
+        "timed_out": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# /release-held — release all held mouse buttons and keyboard keys
+# ---------------------------------------------------------------------------
+@app.post("/release-held")
+async def release_held():
+    from engine.routers.mouse import release_all_held as release_mouse
+    from engine.routers.keyboard import release_all_held_keys as release_keys
+    released_buttons = release_mouse()
+    released_keys = release_keys()
+    return {
+        "success": True,
+        "data": {"released_buttons": released_buttons, "released_keys": released_keys},
         "error": None,
         "timed_out": False,
     }

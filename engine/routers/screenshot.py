@@ -23,7 +23,7 @@ import mss
 import mss.tools
 from fastapi import APIRouter
 from PIL import Image, ImageDraw, ImageColor
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from engine import dpi_utils
 
@@ -94,15 +94,15 @@ def _draw_annotation(
 class ScreenshotRequest(BaseModel):
     top: Optional[int] = None
     left: Optional[int] = None
-    width: Optional[int] = None
-    height: Optional[int] = None
+    width: Optional[int] = Field(None, ge=1)
+    height: Optional[int] = Field(None, ge=1)
 
 
 class ZoomRequest(BaseModel):
     x: int
     y: int
-    width: int = 200
-    height: int = 200
+    width: int = Field(200, ge=1)
+    height: int = Field(200, ge=1)
     annotate: bool = True
 
 
@@ -153,7 +153,12 @@ async def take_screenshot(req: ScreenshotRequest):
             )
 
             if full_screen:
-                # Capture entire virtual desktop
+                # Capture entire virtual desktop.
+                # NOTE (mixed-DPI limitation): The primary monitor's DPI scale is
+                # applied uniformly to the whole image.  On setups where monitors
+                # have different DPI scales, coordinates on non-primary monitors
+                # will be slightly misaligned.  Accurate multi-DPI support would
+                # require per-monitor capture-and-stitch.
                 monitor = virtual_mon
                 dpi_scale = dpi_utils.get_primary_scale(monitor_map)
             else:
@@ -366,8 +371,8 @@ async def screenshot_annotate(req: AnnotateRequest):
         draw = ImageDraw.Draw(img)
         skipped_annotations: list[int] = []
 
-        crop_left = req.left or 0
-        crop_top = req.top or 0
+        crop_left = req.left if req.left is not None else 0
+        crop_top = req.top if req.top is not None else 0
         for i, ann in enumerate(req.annotations):
             img_x = round((ann.x - crop_left) * image_scale)
             img_y = round((ann.y - crop_top) * image_scale)

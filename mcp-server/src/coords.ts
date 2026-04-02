@@ -13,6 +13,7 @@ export const SCREENSHOT_MAX_H = 882;
  * Use for full-screen context (no crop offset) or dimension values.
  */
 export function toLogicalCoord(imagePixel: number, scale: number): number {
+  if (scale <= 0) return imagePixel;
   return scale === 1.0 ? imagePixel : Math.round(imagePixel / scale);
 }
 
@@ -21,6 +22,7 @@ export function toLogicalCoord(imagePixel: number, scale: number): number {
  * Applies scale division then adds the crop offset (0 for full-screen).
  */
 export function toLogicalPos(imagePixel: number, scale: number, offset: number): number {
+  if (scale <= 0) return imagePixel + offset;
   return (scale === 1.0 ? imagePixel : Math.round(imagePixel / scale)) + offset;
 }
 
@@ -30,6 +32,7 @@ export function toLogicalPos(imagePixel: number, scale: number, offset: number):
  * semantically distinct: dimensions never have an offset.
  */
 export function toLogicalDimCoord(imagePixel: number, scale: number): number {
+  if (scale <= 0) return imagePixel;
   return scale === 1.0 ? imagePixel : Math.round(imagePixel / scale);
 }
 
@@ -38,6 +41,7 @@ export function toLogicalDimCoord(imagePixel: number, scale: number): number {
  * Inverse of toLogicalPos: subtract offset, then multiply by scale.
  */
 export function toImageCoord(logicalPixel: number, scale: number, offset: number): number {
+  if (scale <= 0) return logicalPixel - offset;
   const v = logicalPixel - offset;
   return scale === 1.0 ? v : Math.round(v * scale);
 }
@@ -47,5 +51,6 @@ export function toImageCoord(logicalPixel: number, scale: number, offset: number
  * No offset — dimensions don't have one.
  */
 export function toImageDimCoord(logicalDim: number, scale: number): number {
+  if (scale <= 0) return logicalDim;
   return scale === 1.0 ? logicalDim : Math.round(logicalDim * scale);
 }

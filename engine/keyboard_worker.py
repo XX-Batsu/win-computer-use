@@ -30,7 +30,17 @@ def keyboard_worker(queue: multiprocessing.Queue, action: str, args: dict) -> No
 
 def _run_pyautogui(action: str, args: dict):
     if action == "type":
-        pyautogui.typewrite(args["text"], interval=args.get("interval", 0.0))
+        text = args["text"]
+        interval = args.get("interval", 0.0)
+        # pyautogui.typewrite() only supports ASCII printable characters.
+        # For text containing non-ASCII, use clipboard-paste fallback.
+        has_non_ascii = any(ord(c) > 126 or (ord(c) < 32 and c not in ('\t', '\n', '\r')) for c in text)
+        if has_non_ascii:
+            import pyperclip
+            pyperclip.copy(text)
+            pyautogui.hotkey("ctrl", "v")
+        else:
+            pyautogui.typewrite(text, interval=interval)
         return None
     elif action == "hotkey":
         pyautogui.hotkey(*args["keys"])

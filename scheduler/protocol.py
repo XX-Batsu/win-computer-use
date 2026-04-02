@@ -1,7 +1,7 @@
 """
 protocol.py — Pydantic models for the Windows Computer Use scheduler.
 
-Defines all 19 tool command models, the discriminated Command union,
+Defines all 22 tool command models, the discriminated Command union,
 ClaudeResponse, TaskDefinition, and the JSON command schema.
 """
 
@@ -25,8 +25,8 @@ class NoArgs(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ScreenshotArgs(BaseModel):
-    top: int = 0
-    left: int = 0
+    top: Optional[int] = None
+    left: Optional[int] = None
     width: Optional[int] = None
     height: Optional[int] = None
 
@@ -61,11 +61,21 @@ class MouseClickCmd(BaseModel):
     args: MouseClickArgs
 
 
+class DragWaypoint(BaseModel):
+    x: int
+    y: int
+
+
 class MouseDragArgs(BaseModel):
     x1: int
     y1: int
     x2: int
     y2: int
+    button: Literal["left", "right", "middle"] = "left"
+    duration: float = Field(0.5, ge=0.0, le=10.0)
+    hold_before: float = Field(0.2, ge=0.0, le=5.0)
+    steps: Optional[int] = Field(None, ge=1, le=200)
+    waypoints: Optional[list[DragWaypoint]] = None
 
 
 class MouseDragCmd(BaseModel):
@@ -82,6 +92,39 @@ class MouseScrollArgs(BaseModel):
 class MouseScrollCmd(BaseModel):
     tool: Literal["mouse_scroll"]
     args: MouseScrollArgs
+
+
+class MouseDoubleClickArgs(BaseModel):
+    x: int
+    y: int
+    button: Literal["left", "right", "middle"] = "left"
+
+
+class MouseDoubleClickCmd(BaseModel):
+    tool: Literal["mouse_double_click"]
+    args: MouseDoubleClickArgs
+
+
+class MouseDownArgs(BaseModel):
+    x: int
+    y: int
+    button: Literal["left", "right", "middle"] = "left"
+
+
+class MouseDownCmd(BaseModel):
+    tool: Literal["mouse_down"]
+    args: MouseDownArgs
+
+
+class MouseUpArgs(BaseModel):
+    button: Literal["left", "right", "middle"] = "left"
+    x: Optional[int] = None
+    y: Optional[int] = None
+
+
+class MouseUpCmd(BaseModel):
+    tool: Literal["mouse_up"]
+    args: MouseUpArgs
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +219,7 @@ class RunShellArgs(BaseModel):
     shell: Literal["cmd", "powershell"] = "cmd"
     cwd: Optional[str] = None
     timeout: int = Field(30, ge=1, le=300)
+    env_extra: Optional[dict[str, str]] = None
 
 
 class RunShellCmd(BaseModel):
@@ -212,7 +256,7 @@ class CreateDesktopCmd(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Discriminated Union over all 19 command types
+# Discriminated Union over all 22 command types
 # ---------------------------------------------------------------------------
 
 Command = Annotated[
@@ -222,6 +266,9 @@ Command = Annotated[
         MouseClickCmd,
         MouseDragCmd,
         MouseScrollCmd,
+        MouseDoubleClickCmd,
+        MouseDownCmd,
+        MouseUpCmd,
         KeyboardTypeCmd,
         KeyboardHotkeyCmd,
         KeyboardKeydownCmd,
@@ -245,17 +292,43 @@ Command = Annotated[
 # JSON command schema (passed to claude via --json-schema)
 # ---------------------------------------------------------------------------
 
+# Must stay in sync with the Command discriminated union above.
+_VALID_TOOLS = [
+    "screenshot",
+    "mouse_move",
+    "mouse_click",
+    "mouse_drag",
+    "mouse_scroll",
+    "mouse_double_click",
+    "mouse_down",
+    "mouse_up",
+    "keyboard_type",
+    "keyboard_hotkey",
+    "keydown",
+    "keyup",
+    "list_windows",
+    "focus_window",
+    "set_window_state",
+    "get_clipboard",
+    "set_clipboard",
+    "run_shell",
+    "list_desktops",
+    "switch_desktop",
+    "create_desktop",
+    "delete_desktop",
+]
+
 COMMAND_SCHEMA: dict = {
     "type": "object",
     "properties": {
         "protocol_version": {"type": "integer", "const": 1},
-        "reasoning": {"type": "string", "maxLength": 500},
+        "reasoning": {"type": "string", "maxLength": 2000},
         "commands": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
-                    "tool": {"type": "string"},
+                    "tool": {"type": "string", "enum": _VALID_TOOLS},
                     "args": {"type": "object"},
                 },
                 "required": ["tool", "args"],
@@ -274,7 +347,7 @@ COMMAND_SCHEMA: dict = {
 class ClaudeResponse(BaseModel):
     protocol_version: int
     reasoning: str
-    commands: list[Command]
+    commands: list[Command] = Field(..., min_length=1)
     done: bool
 
 

@@ -189,9 +189,22 @@ def _acquire_lock(sanitized_name: str) -> Path:
             else:
                 logger.info("Stale lockfile (PID %d not alive) — overwriting", existing_pid)
 
-        # Stale lock — overwrite
-        lock_path.write_text(json.dumps(payload), encoding="utf-8")
-        logger.debug("Acquired lock (overwrote stale): %s", lock_path)
+        # Stale lock — remove and re-acquire atomically
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass  # another process already removed it
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, payload_bytes)
+            finally:
+                os.close(fd)
+        except FileExistsError:
+            raise RuntimeError(
+                f"Lost lock race for {sanitized_name!r} — another scheduler acquired it"
+            )
+        logger.debug("Acquired lock (replaced stale): %s", lock_path)
         return lock_path
 
 
@@ -265,6 +278,11 @@ def check_engine_health() -> bool:
 _image_scale: float = 1.0
 """Scale factor from the last screenshot (image pixels / logical pixels)."""
 
+_crop_offset_x: int = 0
+_crop_offset_y: int = 0
+"""Logical-pixel origin of the last crop (0,0 for full-screen).
+Mirrors the MCP layer's cropOffsetX/Y so headless crop screenshots work."""
+
 
 def take_screenshot() -> bytes:
     """Capture full-screen screenshot; return raw PNG bytes.
@@ -286,8 +304,28 @@ def take_screenshot() -> bytes:
 # Command → Engine HTTP dispatch
 # ===========================================================================
 
-def _to_logical(v: float) -> int:
-    """Map a coordinate from image-pixel space to logical-pixel space."""
+def _to_logical_pos(v: float, offset: int) -> int:
+    """Map a position from image-pixel space to full-screen logical-pixel space."""
+    if _image_scale <= 0.0:
+        return int(v) + offset
+    base = round(v / _image_scale) if _image_scale != 1.0 else int(v)
+    return base + offset
+
+
+def _to_logical_x(v: float) -> int:
+    """Map an X position: scale + crop offset."""
+    return _to_logical_pos(v, _crop_offset_x)
+
+
+def _to_logical_y(v: float) -> int:
+    """Map a Y position: scale + crop offset."""
+    return _to_logical_pos(v, _crop_offset_y)
+
+
+def _to_logical_dim(v: float) -> int:
+    """Map a dimension (width/height): scale only, no offset."""
+    if _image_scale <= 0.0:
+        return int(v)
     return round(v / _image_scale) if _image_scale != 1.0 else int(v)
 
 
@@ -301,34 +339,79 @@ def dispatch_command(cmd: Command) -> dict[str, Any]:
 
     # --- Screenshot ---
     if tool == "screenshot":
+        global _image_scale, _crop_offset_x, _crop_offset_y
         a = args  # ScreenshotArgs
+        is_crop = a.width is not None and a.height is not None
         body: dict[str, Any] = {}
-        if a.width is not None:
-            body["width"] = _to_logical(a.width)
-        if a.height is not None:
-            body["height"] = _to_logical(a.height)
-        if a.top is not None:
-            body["top"] = _to_logical(a.top)
+        logical_left = 0
+        logical_top = 0
         if a.left is not None:
-            body["left"] = _to_logical(a.left)
-        return _engine_post("/screenshot", body)
+            logical_left = _to_logical_x(a.left)
+            body["left"] = logical_left
+        if a.top is not None:
+            logical_top = _to_logical_y(a.top)
+            body["top"] = logical_top
+        if a.width is not None:
+            body["width"] = _to_logical_dim(a.width)
+        if a.height is not None:
+            body["height"] = _to_logical_dim(a.height)
+        result = _engine_post("/screenshot", body)
+        # Update crop state to mirror MCP behaviour
+        if result.get("success"):
+            _image_scale = result["data"].get("image_scale", 1.0)
+            if is_crop:
+                _crop_offset_x = logical_left
+                _crop_offset_y = logical_top
+            else:
+                _crop_offset_x = 0
+                _crop_offset_y = 0
+        return result
 
     # --- Mouse (coordinates remapped from image-pixel to logical) ---
     if tool == "mouse_move":
-        return _engine_post("/mouse", {"action": "move", "x": _to_logical(args.x), "y": _to_logical(args.y)})
+        return _engine_post("/mouse", {"action": "move", "x": _to_logical_x(args.x), "y": _to_logical_y(args.y)})
     if tool == "mouse_click":
         return _engine_post(
-            "/mouse", {"action": "click", "x": _to_logical(args.x), "y": _to_logical(args.y), "button": args.button}
+            "/mouse", {"action": "click", "x": _to_logical_x(args.x), "y": _to_logical_y(args.y), "button": args.button}
         )
     if tool == "mouse_drag":
-        return _engine_post(
-            "/mouse",
-            {"action": "drag", "x": _to_logical(args.x1), "y": _to_logical(args.y1), "x2": _to_logical(args.x2), "y2": _to_logical(args.y2)},
-        )
+        drag_body: dict[str, Any] = {
+            "action": "drag",
+            "x": _to_logical_x(args.x1),
+            "y": _to_logical_y(args.y1),
+            "x2": _to_logical_x(args.x2),
+            "y2": _to_logical_y(args.y2),
+            "button": args.button,
+            "duration": args.duration,
+        }
+        if hasattr(args, "hold_before") and args.hold_before is not None:
+            drag_body["hold_before"] = args.hold_before
+        if hasattr(args, "steps") and args.steps is not None:
+            drag_body["steps"] = args.steps
+        if hasattr(args, "waypoints") and args.waypoints:
+            drag_body["waypoints"] = [
+                {"x": _to_logical_x(wp.x), "y": _to_logical_y(wp.y)}
+                for wp in args.waypoints
+            ]
+        return _engine_post("/mouse", drag_body)
     if tool == "mouse_scroll":
         return _engine_post(
-            "/mouse", {"action": "scroll", "x": _to_logical(args.x), "y": _to_logical(args.y), "amount": args.amount}
+            "/mouse", {"action": "scroll", "x": _to_logical_x(args.x), "y": _to_logical_y(args.y), "amount": args.amount}
         )
+    if tool == "mouse_double_click":
+        return _engine_post(
+            "/mouse", {"action": "double_click", "x": _to_logical_x(args.x), "y": _to_logical_y(args.y), "button": args.button}
+        )
+    if tool == "mouse_down":
+        return _engine_post(
+            "/mouse", {"action": "mousedown", "x": _to_logical_x(args.x), "y": _to_logical_y(args.y), "button": args.button}
+        )
+    if tool == "mouse_up":
+        body_up: dict[str, Any] = {"action": "mouseup", "button": args.button}
+        if args.x is not None and args.y is not None:
+            body_up["x"] = _to_logical_x(args.x)
+            body_up["y"] = _to_logical_y(args.y)
+        return _engine_post("/mouse", body_up)
 
     # --- Keyboard ---
     if tool == "keyboard_type":
@@ -362,6 +445,8 @@ def dispatch_command(cmd: Command) -> dict[str, Any]:
         body = {"command": args.command, "shell": args.shell, "timeout": args.timeout}
         if args.cwd is not None:
             body["cwd"] = args.cwd
+        if args.env_extra is not None:
+            body["env_extra"] = args.env_extra
         return _engine_post("/shell", body, timeout=60)
 
     # --- Virtual Desktop ---
@@ -389,22 +474,34 @@ Respond ONLY with valid JSON matching the schema provided via --json-schema.
 Do not include any prose, explanation, or markdown outside the JSON.
 
 Available tools and their argument shapes:
-- screenshot(top?, left?, width?, height?) — capture screen region in logical pixels
+- screenshot(top?, left?, width?, height?) — capture screen or region; pass coordinates from the current screenshot directly
 - mouse_move(x, y)
 - mouse_click(x, y, button?) — button: "left"|"right"|"middle", default "left"
-- mouse_drag(x1, y1, x2, y2)
+- mouse_double_click(x, y, button?) — double-click at (x, y)
+- mouse_drag(x1, y1, x2, y2, button?, duration?, hold_before?, steps?, waypoints?) — button: "left"|"right"|"middle"; duration: seconds, default 0.5; waypoints: [{x, y}, ...] for non-straight paths
 - mouse_scroll(x, y, amount) — amount: wheel notches, positive=up, negative=down
-- keyboard_type(text, interval?) — interval: seconds between keystrokes, default 0
-- keyboard_hotkey(keys: list) — e.g. {"keys": ["ctrl","c"]}
-- keydown(key) / keyup(key)
+- mouse_down(x, y, button?) — hold button at (x, y)
+- mouse_up(button?, x?, y?) — release button, optionally move to (x, y) first; x and y must be provided together
+- keyboard_type(text, interval?) — type literal characters; ASCII uses individual keystrokes, non-ASCII auto-pastes via clipboard. For special keys (Enter, Tab, Escape, arrows) or combos, use keyboard_hotkey instead
+- keyboard_hotkey(keys: list) — e.g. {"keys": ["ctrl","c"]}; also for single special keys: ["enter"], ["tab"], etc.
+- keydown(key) / keyup(key) — always pair keydown with keyup to avoid stuck keys
 - list_windows() — returns [{hwnd, title, pid}]
 - focus_window(hwnd)
 - set_window_state(hwnd, state) — state: "maximize"|"minimize"|"restore"
 - get_clipboard() / set_clipboard(text)
-- run_shell(command, shell?, cwd?, timeout?) — shell: "cmd"|"powershell"; timeout: 1-300s, default 30s
+- run_shell(command, shell?, cwd?, timeout?, env_extra?) — shell: "cmd"|"powershell"; timeout: 1-300s, default 30s; env_extra: {"KEY": "value"}
 - list_desktops() / switch_desktop(index) / create_desktop() / delete_desktop(index)
 
-All coordinates are screenshot pixels.\
+All coordinates are screenshot pixels — use coordinates from the most recent screenshot.
+Coordinates from any screenshot (full-screen or crop) can be passed directly to other tools — the scheduler remaps them automatically.
+Coordinates from older screenshots are invalid after any new screenshot is taken.
+NOTE: screenshot_zoom, screenshot_annotate, find_element, and element_at are NOT available in scheduled mode.
+
+## Response rules
+- `reasoning` (required): briefly explain what you observe and why you chose these commands.
+- `commands`: always include at least one command per step. Do not emit an empty commands array.
+- `done`: set to true ONLY when the task is fully complete and you have verified the result. Set to false if more steps are needed.
+- If a previous step failed (visible in History), adapt your approach rather than blindly retrying.\
 """
 
 
@@ -465,7 +562,7 @@ def build_prompt(
     # --- Current State ---
     lines.append("## Current State")
     lines.append("")
-    lines.append(f"Current screenshot: @{screenshot_path.resolve()}")
+    lines.append("Current screenshot: see the attached image file.")
     lines.append("")
 
     return "\n".join(lines)
@@ -505,6 +602,8 @@ def run_task(task_name: str, model_override: str | None = None) -> None:
     Run a single task end-to-end.  Safe to call from scheduler.py.
     Raises on fatal errors (task not found, validation failure, engine down).
     """
+    if not ENGINE_SECRET:
+        raise RuntimeError("ENGINE_SECRET is not set or is empty")
     # 1. Load tasks
     try:
         tasks = load_tasks()
@@ -539,10 +638,20 @@ def run_task(task_name: str, model_override: str | None = None) -> None:
 
 def _run_task_inner(task: TaskDefinition, safe_name: str) -> None:
     """Inner execution — lock is already held."""
+    global _image_scale, _crop_offset_x, _crop_offset_y
+    _image_scale = 1.0
+    _crop_offset_x = 0
+    _crop_offset_y = 0
 
     # 4. Check Engine health
     if not check_engine_health():
         raise RuntimeError("Engine is not healthy; aborting task")
+
+    # 4a. Release any held mouse buttons / keyboard keys from a previous run
+    try:
+        _engine_post("/release-held")
+    except Exception as exc:
+        logger.warning("Failed to release held state: %s", exc)
 
     # 5. Create log directory
     run_start = ts_now()
@@ -650,6 +759,11 @@ def _execute_step(
     prompt_path.write_text(prompt_text, encoding="utf-8")
 
     # 7c. Invoke claude -p
+    # The screenshot is passed as a positional file argument so that the
+    # Claude CLI attaches it as an image.  The prompt text (fed via stdin)
+    # references "the attached image file" instead of an @-path, because
+    # @-path expansion only works when the prompt is a CLI argument, not
+    # when it is piped through stdin.
     schema_json = json.dumps(COMMAND_SCHEMA)
     cmd = [
         "claude",
@@ -657,11 +771,8 @@ def _execute_step(
         "--model", task.model,
         "--json-schema", schema_json,
         "--output-format", "json",
+        str(screenshot_path.resolve()),
     ]
-    tools_value = getattr(task, "tools", None) or ""
-    if tools_value:
-        cmd += ["--tools", tools_value]
-
     claude_result = _invoke_claude(cmd, prompt_path, task.step_timeout_seconds)
     if claude_result is None:
         return {
@@ -795,7 +906,7 @@ def _invoke_claude(
             if exc.process is not None:
                 try:
                     exc.process.kill()
-                    exc.process.communicate()  # 清理 stdout/stderr 緩衝
+                    exc.process.communicate()  # flush stdout/stderr buffers
                 except OSError:
                     pass
             return "timed_out"

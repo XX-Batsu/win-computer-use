@@ -33,6 +33,23 @@ from typing import List, Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# DPI awareness — must be set before any Win32 display enumeration.
+# PROCESS_PER_MONITOR_DPI_AWARE (2) ensures EnumDisplayMonitors returns
+# logical coordinates and GetDpiForMonitor returns the true per-monitor DPI.
+# ---------------------------------------------------------------------------
+try:
+    _shcore_init = ctypes.WinDLL("Shcore.dll")
+    hr = _shcore_init.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    if hr == 0:
+        logger.info("DPI awareness set to PROCESS_PER_MONITOR_DPI_AWARE")
+    else:
+        # E_ACCESSDENIED (0x80070005) means it was already set (e.g., via manifest)
+        logger.debug("SetProcessDpiAwareness returned HRESULT 0x%08X (may already be set)", hr & 0xFFFFFFFF)
+except Exception:  # noqa: BLE001
+    logger.warning("Could not set DPI awareness — using process default")
+
 # Module-level cache
 _monitor_map: List[Dict] = []
 
@@ -44,10 +61,10 @@ _monitor_map: List[Dict] = []
 # EnumDisplayMonitors callback type
 _MonitorEnumProc = ctypes.WINFUNCTYPE(
     ctypes.c_bool,
-    ctypes.c_ulong,   # HMONITOR
-    ctypes.c_ulong,   # HDC
+    ctypes.c_void_p,  # HMONITOR (pointer-sized handle)
+    ctypes.c_void_p,  # HDC (pointer-sized handle)
     ctypes.POINTER(ctypes.wintypes.RECT),  # lprcMonitor (logical coords)
-    ctypes.c_int64,   # dwData (LPARAM, 64-bit on 64-bit Windows)
+    ctypes.wintypes.LPARAM,  # dwData
 )
 
 _shcore = None
@@ -63,7 +80,10 @@ def _get_shcore():
 
 
 def _get_monitor_scale(hmonitor: int) -> float:
-    """Return DPI scale for *hmonitor* (1.0 = 100 % / 96 DPI)."""
+    """Return DPI scale for *hmonitor* (1.0 = 100 % / 96 DPI).
+
+    Always returns >= 0.5 to prevent division-by-zero in downstream callers.
+    """
     shcore = _get_shcore()
     if shcore is None:
         return 1.0
@@ -73,7 +93,8 @@ def _get_monitor_scale(hmonitor: int) -> float:
         # MDT_EFFECTIVE_DPI = 0
         hr = shcore.GetDpiForMonitor(hmonitor, 0, ctypes.byref(dpi_x), ctypes.byref(dpi_y))
         if hr == 0:  # S_OK
-            return dpi_x.value / 96.0
+            scale = dpi_x.value / 96.0
+            return max(scale, 0.5)  # guard against degenerate DPI values
     except Exception:  # noqa: BLE001
         pass
     return 1.0
@@ -203,23 +224,28 @@ def logical_to_physical(
         if (m["logical_left"] <= logical_x < m["logical_right"] and
                 m["logical_top"] <= logical_y < m["logical_bottom"]):
             scale = m["scale"]
-            phys_x = m["physical_left"] + int((logical_x - m["logical_left"]) * scale)
-            phys_y = m["physical_top"]  + int((logical_y - m["logical_top"])  * scale)
+            phys_x = m["physical_left"] + round((logical_x - m["logical_left"]) * scale)
+            phys_y = m["physical_top"]  + round((logical_y - m["logical_top"])  * scale)
             return phys_x, phys_y, scale
 
-    # Outside all monitors — fall back to primary scale
+    # Outside all monitors — fall back to the *nearest* monitor (by center distance)
+    # to avoid large coordinate jumps at secondary monitor boundaries.
     logger.warning(
-        "Coordinate (%d, %d) is outside all known monitors; using primary scale",
+        "Coordinate (%d, %d) is outside all known monitors; using nearest monitor",
         logical_x, logical_y,
     )
-    primary = monitor_map[0] if monitor_map else {
-        "physical_left": 0, "physical_top": 0,
-        "logical_left": 0, "logical_top": 0,
-        "scale": 1.0,
-    }
-    scale = primary["scale"]
-    phys_x = primary["physical_left"] + int((logical_x - primary["logical_left"]) * scale)
-    phys_y = primary["physical_top"]  + int((logical_y - primary["logical_top"])  * scale)
+    if not monitor_map:
+        return logical_x, logical_y, 1.0
+
+    def _center_dist(m: Dict) -> float:
+        cx = (m["logical_left"] + m["logical_right"]) / 2
+        cy = (m["logical_top"] + m["logical_bottom"]) / 2
+        return (logical_x - cx) ** 2 + (logical_y - cy) ** 2
+
+    nearest = min(monitor_map, key=_center_dist)
+    scale = nearest["scale"]
+    phys_x = nearest["physical_left"] + round((logical_x - nearest["logical_left"]) * scale)
+    phys_y = nearest["physical_top"]  + round((logical_y - nearest["logical_top"])  * scale)
     return phys_x, phys_y, scale
 
 
@@ -245,17 +271,21 @@ def physical_to_logical(
             logical_y = m["logical_top"]  + round((phys_y - m["physical_top"])  / scale)
             return logical_x, logical_y, scale
 
-    # Outside all monitors — fall back to primary scale
+    # Outside all monitors — fall back to the *nearest* monitor
     logger.warning(
-        "Physical coordinate (%d, %d) is outside all known monitors; using primary scale",
+        "Physical coordinate (%d, %d) is outside all known monitors; using nearest monitor",
         phys_x, phys_y,
     )
-    primary = monitor_map[0] if monitor_map else {
-        "physical_left": 0, "physical_top": 0,
-        "logical_left": 0, "logical_top": 0,
-        "scale": 1.0,
-    }
-    scale = primary["scale"]
-    logical_x = primary["logical_left"] + round((phys_x - primary["physical_left"]) / scale)
-    logical_y = primary["logical_top"]  + round((phys_y - primary["physical_top"])  / scale)
+    if not monitor_map:
+        return phys_x, phys_y, 1.0
+
+    def _center_dist(m: Dict) -> float:
+        cx = (m["physical_left"] + m["physical_right"]) / 2
+        cy = (m["physical_top"] + m["physical_bottom"]) / 2
+        return (phys_x - cx) ** 2 + (phys_y - cy) ** 2
+
+    nearest = min(monitor_map, key=_center_dist)
+    scale = nearest["scale"]
+    logical_x = nearest["logical_left"] + round((phys_x - nearest["physical_left"]) / scale)
+    logical_y = nearest["logical_top"]  + round((phys_y - nearest["physical_top"])  / scale)
     return logical_x, logical_y, scale

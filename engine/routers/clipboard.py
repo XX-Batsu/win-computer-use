@@ -22,7 +22,7 @@ async def _clipboard_read_with_retry() -> str:
     last_err: Exception = RuntimeError("unknown clipboard error")
     for attempt in range(_MAX_RETRIES):
         try:
-            return pyperclip.paste()
+            return await asyncio.to_thread(pyperclip.paste)
         except Exception as e:  # noqa: BLE001
             last_err = e
             if attempt < _MAX_RETRIES - 1:
@@ -34,7 +34,7 @@ async def _clipboard_write_with_retry(text: str) -> None:
     last_err: Exception = RuntimeError("unknown clipboard error")
     for attempt in range(_MAX_RETRIES):
         try:
-            pyperclip.copy(text)
+            await asyncio.to_thread(pyperclip.copy, text)
             return
         except Exception as e:  # noqa: BLE001
             last_err = e
