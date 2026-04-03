@@ -154,13 +154,17 @@ class KeyboardKeyArgs(BaseModel):
     key: str
 
 
+# NOTE: "keydown"/"keyup" break the category_action naming convention used by all other
+# tools (keyboard_type, keyboard_hotkey, etc.). The MCP server registers "keyboard_keydown"
+# and "keyboard_keyup" as canonical aliases; both names are accepted here so that scheduled
+# tasks can use either form.
 class KeyboardKeydownCmd(BaseModel):
-    tool: Literal["keydown"]
+    tool: Literal["keydown", "keyboard_keydown"]
     args: KeyboardKeyArgs
 
 
 class KeyboardKeyupCmd(BaseModel):
-    tool: Literal["keyup"]
+    tool: Literal["keyup", "keyboard_keyup"]
     args: KeyboardKeyArgs
 
 
@@ -305,7 +309,9 @@ _VALID_TOOLS = [
     "keyboard_type",
     "keyboard_hotkey",
     "keydown",
+    "keyboard_keydown",
     "keyup",
+    "keyboard_keyup",
     "list_windows",
     "focus_window",
     "set_window_state",

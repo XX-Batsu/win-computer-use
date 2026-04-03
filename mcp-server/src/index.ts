@@ -105,6 +105,31 @@ async function enginePost<T>(
   return (await res.json()) as EngineResponse<T>;
 }
 
+// ── P2 helpers ───────────────────────────────────────────────────────────────
+
+interface ZoomData {
+  image: string;
+  dpi_scale: number;
+  image_scale: number;
+  logical_size: [number, number];
+  image_size: [number, number];
+  physical_size: [number, number];
+  virtual_origin: unknown;
+}
+
+// NOTE: must never update cropOffset or imageScale — see P2 Key Constraint.
+// handleTool is the only path that may update coordinate state.
+// Any refactor that routes the verification zoom through handleTool is a bug.
+async function fetchZoomRaw(logicalX: number, logicalY: number): Promise<EngineResponse<ZoomData>> {
+  return enginePost<ZoomData>("/screenshot/zoom", {
+    x: logicalX,
+    y: logicalY,
+    width: 160,
+    height: 80,
+    annotate: true,
+  });
+}
+
 async function engineDelete<T>(path: string): Promise<EngineResponse<T>> {
   let res: Response;
   try {
@@ -505,7 +530,8 @@ export const TOOLS: Tool[] = [
       "Press and hold a key without releasing. Key names follow pyautogui conventions " +
       "(e.g., 'shift', 'ctrl', 'alt', 'win'). Always follow with keyup for the same key to avoid " +
       "leaving keys stuck. Use keyboard_hotkey for simple combos — keydown/keyup is only needed when " +
-      "you must hold a key across multiple other operations (e.g., Shift+click on several items).",
+      "you must hold a key across multiple other operations (e.g., Shift+click on several items). " +
+      "Also available as `keyboard_keydown`.",
     inputSchema: {
       type: "object",
       properties: {
@@ -517,7 +543,35 @@ export const TOOLS: Tool[] = [
   {
     name: "keyup",
     description:
-      "Release a held key. Must always be paired with a prior keydown call for the same key.",
+      "Release a held key. Must always be paired with a prior keydown call for the same key. " +
+      "Also available as `keyboard_keyup`.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: { type: "string", description: "Key name to release" },
+      },
+      required: ["key"],
+    },
+  },
+  {
+    name: "keyboard_keydown",
+    description:
+      "Alias for `keydown`. Press and hold a key without releasing. Key names follow pyautogui conventions " +
+      "(e.g., 'shift', 'ctrl', 'alt', 'win'). Always follow with keyboard_keyup for the same key to avoid " +
+      "leaving keys stuck. Use keyboard_hotkey for simple combos — keyboard_keydown/keyboard_keyup is only needed when " +
+      "you must hold a key across multiple other operations (e.g., Shift+click on several items).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: { type: "string", description: "Key name to press and hold (e.g., 'shift', 'ctrl', 'alt')" },
+      },
+      required: ["key"],
+    },
+  },
+  {
+    name: "keyboard_keyup",
+    description:
+      "Alias for `keyup`. Release a held key. Must always be paired with a prior keyboard_keydown call for the same key.",
     inputSchema: {
       type: "object",
       properties: {
@@ -586,7 +640,8 @@ export const TOOLS: Tool[] = [
       "Run a shell command and return its output. Default shell is cmd; pass shell='powershell' " +
       "for PowerShell commands. Use PowerShell for complex tasks (JSON parsing, regex, object pipelines). " +
       "Timeout is 1–300 seconds (default 30). Output is returned in full — pipe to findstr (cmd) or " +
-      "Select-String (powershell) to filter large outputs.",
+      "Select-String (powershell) to filter large outputs. " +
+      "Large outputs may be truncated by the AI context window. Filter or limit results for commands likely to produce extensive output.",
     inputSchema: {
       type: "object",
       properties: {
@@ -652,8 +707,9 @@ export const TOOLS: Tool[] = [
     name: "find_element",
     description:
       "Search for UI elements by name, type, or automation ID within a window. " +
-      "Requires at least one target (hwnd or title) and at least one filter (name, control_type, " +
-      "or automation_id). Use this for precise coordinates of small, dense, or hard-to-distinguish " +
+      "REQUIRED: at least one target (hwnd or title) AND at least one filter (name, control_type, " +
+      "or automation_id) — omitting both will return an error. " +
+      "Use this for precise coordinates of small, dense, or hard-to-distinguish " +
       "elements (list items, menu entries, toolbar buttons). Use list_windows first to get the " +
       "window handle, or pass a title substring. Prefer screenshot + visual coordinate picking for " +
       "large, obvious targets. Returned element center and bounding_rect are in screenshot pixels. " +
@@ -661,14 +717,14 @@ export const TOOLS: Tool[] = [
     inputSchema: {
       type: "object",
       properties: {
-        hwnd: { type: "integer", description: "Window handle from list_windows" },
-        title: { type: "string", description: "Window title substring (alternative to hwnd)" },
-        name: { type: "string", description: "Element name to search for (partial match, case-insensitive)" },
+        hwnd: { type: "integer", description: "Window handle from list_windows (REQUIRED if title not provided)" },
+        title: { type: "string", description: "Window title substring (REQUIRED if hwnd not provided)" },
+        name: { type: "string", description: "Element name to search for (partial match, case-insensitive) — at least one filter required" },
         control_type: {
           type: "string",
-          description: "UI Automation control type, e.g. Button, ListItem, Edit, CheckBox, MenuItem",
+          description: "UI Automation control type, e.g. Button, ListItem, Edit, CheckBox, MenuItem — at least one filter required",
         },
-        automation_id: { type: "string", description: "Automation ID (exact match)" },
+        automation_id: { type: "string", description: "Automation ID (exact match) — at least one filter required" },
         max_depth: { type: "integer", description: "Search depth limit (default 5, max 20)" },
         max_results: { type: "integer", description: "Maximum elements to return (default 20, max 100)" },
         timeout: { type: "number", description: "Search timeout in seconds (default 5.0, max 30)" },
@@ -680,12 +736,12 @@ export const TOOLS: Tool[] = [
     description:
       "Identify the UI element at given coordinates using Windows UI Automation.\n" +
       "Returns element name, control_type, automation_id, and exact bounding_rect.\n\n" +
-      "Try this tool first for any standard UI target.\n" +
+      "Consider this tool for small or ambiguous UI targets.\n" +
       "Fast and returns semantic info (you know what the element IS, not just what it looks like).\n\n" +
       "Best for: standard UI controls — buttons, inputs, checkboxes, menus, list items.\n\n" +
       "Not suitable for: game canvases, browser content, map tiles, custom-drawn areas,\n" +
       "or any region where UI Automation returns nothing useful.\n" +
-      "Only fall back to screenshot_zoom or screenshot_annotate if this returns an empty\n" +
+      "Fall back to screenshot_zoom or screenshot_annotate if this returns an empty\n" +
       "result or a generic/unhelpful element type.",
     inputSchema: {
       type: "object",
@@ -713,7 +769,7 @@ export async function handleTool(
       // ── Screenshot ──────────────────────────────────────────────────────
       case "screenshot": {
         const isCrop = args.width !== undefined && args.height !== undefined;
-        const body: Record<string, number> = {};
+        const body: Record<string, unknown> = {};
 
         // Convert input args from current-screenshot image pixels to logical pixels.
         // toLogicalX/Y apply the active crop offset, so nested crops work correctly.
@@ -723,6 +779,7 @@ export async function handleTool(
         if (args.top    !== undefined) body.top    = logicalTop;
         if (args.width  !== undefined) body.width  = toLogicalDim(args.width  as number);
         if (args.height !== undefined) body.height = toLogicalDim(args.height as number);
+        if (!isCrop) body.ruler = true;
 
         const resp = await enginePost<{
           image: string;
@@ -732,6 +789,8 @@ export async function handleTool(
           image_size: [number, number];
           physical_size: [number, number];
           virtual_origin: unknown;
+          ruler_width?: number;
+          ruler_height?: number;
         }>("/screenshot", body);
         if (!resp.success) {
           return errorContent(`screenshot failed: ${resp.error ?? "unknown error"}`);
@@ -754,10 +813,25 @@ export async function handleTool(
         const [lw, lh] = resp.data.logical_size;
         const [iw, ih] = resp.data.image_size;
         const [pw, ph] = resp.data.physical_size;
-        const meta =
-          `Screenshot: ${iw}\u00d7${ih} image pixels (logical ${lw}\u00d7${lh}, physical ${pw}\u00d7${ph}, ` +
-          `DPI scale ${resp.data.dpi_scale}, image scale ${resp.data.image_scale.toFixed(4)}). ` +
-          `Use coordinates from this image directly — they are remapped automatically.`;
+
+        let meta: string;
+        if (isCrop) {
+          meta =
+            `Screenshot: ${iw}\u00d7${ih} image pixels (logical ${lw}\u00d7${lh}, physical ${pw}\u00d7${ph}, ` +
+            `DPI scale ${resp.data.dpi_scale}, image scale ${resp.data.image_scale.toFixed(4)}). ` +
+            `Crop origin: logical (${cropOffsetX}, ${cropOffsetY}). Coordinates from this image are in crop-relative image pixels, automatically remapped.`;
+        } else {
+          const rulerWidth = resp.data.ruler_width ?? 0;
+          const rulerHeight = resp.data.ruler_height ?? 0;
+          const contentW = iw - rulerWidth;
+          const contentH = ih - rulerHeight;
+          meta =
+            `Screenshot: content ${contentW}\u00d7${contentH} image pixels (full image ${iw}\u00d7${ih} includes ruler strips, ` +
+            `logical ${lw}\u00d7${lh}, physical ${pw}\u00d7${ph}, DPI scale ${resp.data.dpi_scale}, ` +
+            `image scale ${resp.data.image_scale.toFixed(4)}). ` +
+            `Ruler strips: ${rulerWidth}px right (Y), ${rulerHeight}px bottom (X) \u2014 ruler labels are image pixel coordinates, not logical coordinates. ` +
+            `Use image pixel coordinates from the content area only (x: 0\u2013${contentW - 1}, y: 0\u2013${contentH - 1}); the ruler strips are not click targets and must not be used as coordinate sources.`;
+        }
 
         const metaContent: TextContent = { type: "text", text: meta };
         const imageContent: ImageContent = {
@@ -810,7 +884,8 @@ export async function handleTool(
         const [pw, ph] = resp.data.physical_size;
         const meta =
           `Zoom screenshot (${iw}\u00d7${ih} image pixels, logical ${lw}\u00d7${lh}, physical ${pw}\u00d7${ph}, ` +
-          `DPI scale ${resp.data.dpi_scale}, image scale ${resp.data.image_scale.toFixed(4)}). ` +
+          `DPI scale ${resp.data.dpi_scale}, image scale ${resp.data.image_scale.toFixed(4)}). ` + // NOTE: this exact format is used as a structural anchor in P1 — do not change without updating the P1 insertion logic.
+          `Crop origin: logical (${cropOffsetX}, ${cropOffsetY}). ` +
           `Coordinates from this image are relative to the zoomed region.`;
 
         return {
@@ -892,25 +967,61 @@ export async function handleTool(
       }
 
       case "mouse_click": {
-        const resp = await enginePost("/mouse", {
+        const logicalX = toLogicalX(args.x as number);
+        const logicalY = toLogicalY(args.y as number);
+        const clickResp = await enginePost("/mouse", {
           action: "click",
-          x: toLogicalX(args.x as number),
-          y: toLogicalY(args.y as number),
+          x: logicalX,
+          y: logicalY,
           button: args.button ?? "left",
         });
-        if (!resp.success) return errorContent(`mouse_click failed: ${resp.error}`);
-        return textContent("Mouse clicked.");
+        if (!clickResp.success) return errorContent(`mouse_click failed: ${clickResp.error}`);
+
+        const confirmText = `Mouse clicked at logical (${logicalX}, ${logicalY}).`;
+        let zoomResp: EngineResponse<ZoomData>;
+        try {
+          zoomResp = await fetchZoomRaw(logicalX, logicalY);
+        } catch {
+          return textContent(`${confirmText}\n[Verification zoom unavailable — verification service unreachable]`);
+        }
+        if (!zoomResp.success || !zoomResp.data) {
+          return textContent(`${confirmText}\n[Verification zoom unavailable — click was at screen edge]`);
+        }
+        return {
+          content: [
+            { type: "text", text: `${confirmText}\n[Verification zoom — does NOT change coordinate context]` } as TextContent,
+            { type: "image", data: zoomResp.data.image, mimeType: "image/png" } as ImageContent,
+          ],
+        };
       }
 
       case "mouse_double_click": {
-        const resp = await enginePost("/mouse", {
+        const logicalX = toLogicalX(args.x as number);
+        const logicalY = toLogicalY(args.y as number);
+        const clickResp = await enginePost("/mouse", {
           action: "double_click",
-          x: toLogicalX(args.x as number),
-          y: toLogicalY(args.y as number),
+          x: logicalX,
+          y: logicalY,
           button: args.button ?? "left",
         });
-        if (!resp.success) return errorContent(`mouse_double_click failed: ${resp.error}`);
-        return textContent("Mouse double-clicked.");
+        if (!clickResp.success) return errorContent(`mouse_double_click failed: ${clickResp.error}`);
+
+        const confirmText = `Mouse double-clicked at logical (${logicalX}, ${logicalY}).`;
+        let zoomResp: EngineResponse<ZoomData>;
+        try {
+          zoomResp = await fetchZoomRaw(logicalX, logicalY);
+        } catch {
+          return textContent(`${confirmText}\n[Verification zoom unavailable — verification service unreachable]`);
+        }
+        if (!zoomResp.success || !zoomResp.data) {
+          return textContent(`${confirmText}\n[Verification zoom unavailable — click was at screen edge]`);
+        }
+        return {
+          content: [
+            { type: "text", text: `${confirmText}\n[Verification zoom — does NOT change coordinate context]` } as TextContent,
+            { type: "image", data: zoomResp.data.image, mimeType: "image/png" } as ImageContent,
+          ],
+        };
       }
 
       case "mouse_drag": {
@@ -998,7 +1109,8 @@ export async function handleTool(
         return textContent("Hotkey sent.");
       }
 
-      case "keydown": {
+      case "keydown":
+      case "keyboard_keydown": {
         const resp = await enginePost("/keyboard", {
           action: "keydown",
           key: args.key,
@@ -1007,7 +1119,8 @@ export async function handleTool(
         return textContent(`Key down: ${String(args.key)}`);
       }
 
-      case "keyup": {
+      case "keyup":
+      case "keyboard_keyup": {
         const resp = await enginePost("/keyboard", {
           action: "keyup",
           key: args.key,
@@ -1094,6 +1207,16 @@ export async function handleTool(
 
       // ── UI Automation ───────────────────────────────────────────────────
       case "find_element": {
+        if (args.hwnd === undefined && args.title === undefined) {
+          return errorContent(
+            "find_element requires at least one target: provide hwnd (from list_windows) or title (window title substring)."
+          );
+        }
+        if (args.name === undefined && args.control_type === undefined && args.automation_id === undefined) {
+          return errorContent(
+            "find_element requires at least one filter: provide name, control_type, or automation_id."
+          );
+        }
         const body: Record<string, unknown> = {};
         if (args.hwnd !== undefined) body.hwnd = args.hwnd;
         if (args.title !== undefined) body.title = args.title;

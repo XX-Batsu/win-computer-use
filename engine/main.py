@@ -219,6 +219,8 @@ async def reload_dpi():
 @app.get("/screen-info")
 async def screen_info():
     monitor_map = dpi_utils.get_monitor_map()
+    if not monitor_map:
+        return {"success": False, "data": None, "error": "no monitors detected", "timed_out": False}
     # Derive logical virtual-desktop size directly from the monitor map (already in logical coords).
     # Using per-monitor logical_right/bottom avoids the error of dividing a multi-monitor physical
     # extent by only the primary DPI scale, which is wrong on mixed-DPI setups.

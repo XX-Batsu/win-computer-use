@@ -92,10 +92,11 @@ async def focus_window(req: WindowFocusRequest):
         try:
             # Step 4: restore if minimised
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            # Step 5–7: bring to front
+            # Step 5–6: bring to front
+            # SetFocus is omitted: it requires the caller to own the target
+            # window's message-queue thread, which is not guaranteed here.
             win32gui.BringWindowToTop(hwnd)
             win32gui.SetForegroundWindow(hwnd)
-            win32gui.SetFocus(hwnd)
         finally:
             # Step 8: always detach
             if attached and caller_tid != target_tid:

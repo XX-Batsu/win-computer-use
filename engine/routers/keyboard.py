@@ -1,17 +1,22 @@
 """
 routers/keyboard.py — POST /keyboard
 
-Dispatches keyboard actions (type, hotkey, keydown, keyup) through a subprocess
-worker to avoid blocking the async event loop and to safely isolate pyautogui's
-low-level keyboard calls.
+Dispatches keyboard actions (type, hotkey, keydown, keyup) through a worker
+thread to avoid blocking the async event loop while keeping pyautogui's
+low-level keyboard calls isolated from the request handler.
 
-The keyboard_worker module must be a top-level importable module because
-Windows multiprocessing uses 'spawn'.
+Threading notes:
+- pyautogui uses some global state (PAUSE, failsafe). Concurrent requests run
+  from separate threads sharing this state; this is safe for the default PAUSE=0
+  and failsafe settings but callers should not mutate pyautogui globals at runtime.
+- On timeout the worker thread continues until its pyautogui call returns; Python
+  threads cannot be forcibly cancelled. Phantom keystrokes may appear in the
+  foreground window after a timeout response has already been returned.
 """
 
 import asyncio
-import multiprocessing
-from queue import Empty
+import queue
+import threading
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter
@@ -27,37 +32,34 @@ KEYBOARD_TIMEOUT = 30  # seconds
 # Held-key tracking — detect orphaned keydown without matching keyup
 # ---------------------------------------------------------------------------
 _held_keys: set[str] = set()
+_held_keys_lock = threading.Lock()
 
 
 def get_held_keys() -> set[str]:
     """Return the set of currently held keys."""
-    return set(_held_keys)
+    with _held_keys_lock:
+        return set(_held_keys)
 
 
 def release_all_held_keys() -> list[str]:
-    """Release all held keys via subprocess workers. Returns keys released."""
+    """Release all held keys via worker threads. Returns keys released."""
+    with _held_keys_lock:
+        keys_to_release = list(_held_keys)
+
     released = []
-    for key in list(_held_keys):
-        q: multiprocessing.Queue = multiprocessing.Queue()
-        try:
-            proc = multiprocessing.Process(
-                target=kw_module.keyboard_worker,
-                args=(q, "keyup", {"key": key}),
-            )
-            proc.start()
-            proc.join(5)
-            if proc.is_alive():
-                proc.terminate()
-        except Exception:  # noqa: BLE001
-            pass
-        finally:
-            try:
-                q.close()
-                q.join_thread()
-            except Exception:  # noqa: BLE001
-                pass
+    for key in keys_to_release:
+        q: queue.Queue = queue.Queue()
+        t = threading.Thread(
+            target=kw_module.keyboard_worker,
+            args=(q, "keyup", {"key": key}),
+            daemon=True,
+        )
+        t.start()
+        t.join(5)
         released.append(key)
-    _held_keys.clear()
+
+    with _held_keys_lock:
+        _held_keys.clear()
     return released
 
 
@@ -85,30 +87,29 @@ def _build_args(req: KeyboardRequest) -> Dict[str, Any]:
 
 @router.post("/keyboard")
 async def keyboard_action(req: KeyboardRequest):
-    q: multiprocessing.Queue | None = None
     try:
+        if req.action == "type" and not req.text:
+            return {"success": False, "data": None, "error": "text is required for action 'type'", "timed_out": False}
+        if req.action == "hotkey" and not req.keys:
+            return {"success": False, "data": None, "error": "keys must be a non-empty list for action 'hotkey'", "timed_out": False}
+        if req.action in ("keydown", "keyup") and not req.key:
+            return {"success": False, "data": None, "error": f"key is required for action '{req.action}'", "timed_out": False}
+
         args = _build_args(req)
 
-        q = multiprocessing.Queue()
-        proc = multiprocessing.Process(
+        q: queue.Queue = queue.Queue()
+        t = threading.Thread(
             target=kw_module.keyboard_worker,
             args=(q, req.action, args),
+            daemon=True,
         )
-        proc.start()
+        t.start()
 
         loop = asyncio.get_running_loop()
-        # run_in_executor lets the async loop stay responsive while we wait for
-        # the subprocess to finish (proc.join blocks its OS thread, not the loop)
-        await loop.run_in_executor(None, proc.join, KEYBOARD_TIMEOUT)
+        # run_in_executor keeps the async loop responsive while the thread runs
+        await loop.run_in_executor(None, t.join, KEYBOARD_TIMEOUT)
 
-        if proc.is_alive():
-            proc.terminate()
-            proc.join(2)
-            if proc.is_alive():
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+        if t.is_alive():
             return {
                 "success": False,
                 "data": None,
@@ -116,18 +117,18 @@ async def keyboard_action(req: KeyboardRequest):
                 "timed_out": True,
             }
 
-        import queue as _queue
         try:
             result = q.get_nowait()
-        except _queue.Empty:
+        except queue.Empty:
             result = {"success": False, "error": "worker exited without result", "timed_out": False}
 
         # Track held-key state on success
         if result.get("success"):
-            if req.action == "keydown" and req.key:
-                _held_keys.add(req.key)
-            elif req.action == "keyup" and req.key:
-                _held_keys.discard(req.key)
+            with _held_keys_lock:
+                if req.action == "keydown" and req.key:
+                    _held_keys.add(req.key)
+                elif req.action == "keyup" and req.key:
+                    _held_keys.discard(req.key)
 
         return result
 
@@ -138,10 +139,3 @@ async def keyboard_action(req: KeyboardRequest):
             "error": str(e),
             "timed_out": False,
         }
-    finally:
-        if q is not None:
-            try:
-                q.close()
-                q.join_thread()
-            except Exception:  # noqa: BLE001
-                pass

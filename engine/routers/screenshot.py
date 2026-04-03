@@ -22,13 +22,15 @@ from typing import Optional
 import mss
 import mss.tools
 from fastapi import APIRouter
-from PIL import Image, ImageDraw, ImageColor
+from PIL import Image, ImageDraw, ImageColor, ImageFont
 from pydantic import BaseModel, Field, field_validator
 
 from engine import dpi_utils
 
 SCREENSHOT_MAX_W = 1568
 SCREENSHOT_MAX_H = 882
+RULER_WIDTH = 28   # Y-axis strip (right side, px)
+RULER_HEIGHT = 24  # X-axis strip (bottom, px)
 
 router = APIRouter()
 
@@ -91,11 +93,79 @@ def _draw_annotation(
     )
 
 
+def _draw_rulers(img: Image.Image) -> Image.Image:
+    """
+    Expand img canvas by RULER_WIDTH px right and RULER_HEIGHT px bottom.
+    Draw Y-axis ruler on the right strip and X-axis ruler on the bottom strip.
+    Ruler labels are image-pixel coordinates (not logical coordinates).
+
+    Must be called AFTER image_scale is finalised — i.e. after the
+    SCREENSHOT_MAX downscaling step in take_screenshot.
+
+    Returns the expanded image.
+    """
+    content_w, content_h = img.width, img.height
+    new_w = content_w + RULER_WIDTH
+    new_h = content_h + RULER_HEIGHT
+
+    ruled = Image.new("RGB", (new_w, new_h), (0xE8, 0xE8, 0xE8))
+    ruled.paste(img, (0, 0))
+    draw = ImageDraw.Draw(ruled)
+
+    try:
+        font = ImageFont.truetype("arial.ttf", 11)
+    except (IOError, OSError):
+        font = ImageFont.load_default()
+
+    # Y-axis ruler (right strip: x in [content_w, new_w - 1])
+    # Ticks extend LEFT from the strip's left edge into screenshot content.
+    for y_px in range(0, content_h, 50):
+        is_major = (y_px % 100 == 0)
+        tick_len = 12 if is_major else 6
+        draw.line([(content_w - tick_len, y_px), (content_w - 1, y_px)], fill="black", width=1)
+        if is_major:
+            label = str(y_px)
+            bbox = draw.textbbox((0, 0), label, font=font)
+            label_w = bbox[2] - bbox[0]
+            label_h = bbox[3] - bbox[1]
+            lx = content_w + RULER_WIDTH - 4 - label_w  # right-aligned, 4px margin
+            ly = y_px - label_h // 2
+            # Clamp bottom first, then top (top takes priority)
+            bottom_clamp = new_h - label_h - 2
+            if bottom_clamp >= 0:
+                ly = min(ly, bottom_clamp)
+            ly = max(2, ly)
+            draw.text((lx, ly), label, fill="black", font=font)
+
+    # X-axis ruler (bottom strip: y in [content_h, new_h - 1])
+    # Ticks extend UP from the strip's top edge into screenshot content.
+    for x_px in range(0, content_w, 50):
+        is_major = (x_px % 100 == 0)
+        tick_len = 12 if is_major else 6
+        draw.line([(x_px, content_h - tick_len), (x_px, content_h - 1)], fill="black", width=1)
+        if is_major:
+            label = str(x_px)
+            bbox = draw.textbbox((0, 0), label, font=font)
+            label_w = bbox[2] - bbox[0]
+            label_h = bbox[3] - bbox[1]
+            lx = x_px - label_w // 2
+            # Clamp right first, then left (left takes priority)
+            right_clamp = content_w - label_w - 2
+            if right_clamp > 2:
+                lx = min(lx, right_clamp)
+            lx = max(2, lx)
+            ly = content_h + (RULER_HEIGHT - label_h) // 2
+            draw.text((lx, ly), label, fill="black", font=font)
+
+    return ruled
+
+
 class ScreenshotRequest(BaseModel):
     top: Optional[int] = None
     left: Optional[int] = None
     width: Optional[int] = Field(None, ge=1)
     height: Optional[int] = Field(None, ge=1)
+    ruler: bool = False
 
 
 class ZoomRequest(BaseModel):
@@ -169,6 +239,12 @@ async def take_screenshot(req: ScreenshotRequest):
                 phys_left, phys_top, scale = dpi_utils.logical_to_physical(
                     logical_left, logical_top, monitor_map
                 )
+                # NOTE (cross-monitor DPI limitation): scale is taken from the monitor
+                # containing the top-left corner of the region.  If the crop region spans
+                # two monitors with different DPI scales, the single scale value will be
+                # wrong for the portion that falls on the other monitor, producing incorrect
+                # physical dimensions for that portion.  Per-monitor capture-and-stitch
+                # would be required to fix this correctly — left as future work.
                 phys_width = int(req.width * scale)
                 phys_height = int(req.height * scale)
 
@@ -182,7 +258,11 @@ async def take_screenshot(req: ScreenshotRequest):
 
             screenshot = sct.grab(monitor)
 
-            # Convert mss ScreenShot → PIL Image (physical pixels)
+            # Convert mss ScreenShot → PIL Image (physical pixels).
+            # mss guarantees BGRA byte order in screenshot.bgra; "BGRX" tells PIL to
+            # treat the 4th byte as padding (ignored), yielding an RGB image.
+            # If a future mss version changes the pixel format, images will be
+            # silently garbled — verify screenshot.pixel_format == "BGRA" if debugging.
             img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
 
             # Record physical size before downscaling (for P3 metadata)
@@ -203,6 +283,14 @@ async def take_screenshot(req: ScreenshotRequest):
                 new_size = (round(img.width * image_scale), round(img.height * image_scale))
                 img = img.resize(new_size, Image.LANCZOS)
 
+            # P3: Draw ruler strips AFTER image_scale is final.
+            ruler_width = 0
+            ruler_height = 0
+            if req.ruler:
+                img = _draw_rulers(img)
+                ruler_width = RULER_WIDTH
+                ruler_height = RULER_HEIGHT
+
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             b64 = base64.b64encode(buf.getvalue()).decode("ascii")
@@ -217,6 +305,8 @@ async def take_screenshot(req: ScreenshotRequest):
                 "image_size": [img.width, img.height],
                 "physical_size": list(physical_size),
                 "virtual_origin": virtual_origin,
+                "ruler_width": ruler_width,
+                "ruler_height": ruler_height,
             },
             "error": None,
             "timed_out": False,
@@ -263,6 +353,7 @@ async def screenshot_zoom(req: ZoomRequest):
             virtual_mon = sct.monitors[0]
             virtual_origin = {"x": virtual_mon["left"], "y": virtual_mon["top"]}
             screenshot = sct.grab(monitor)
+            # mss BGRA pixel format; "BGRX" treats 4th byte as ignored padding → RGB
             img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
 
         physical_size = (img.width, img.height)
@@ -352,6 +443,7 @@ async def screenshot_annotate(req: AnnotateRequest):
                 dpi_scale = scale
 
             screenshot = sct.grab(monitor)
+            # mss BGRA pixel format; "BGRX" treats 4th byte as ignored padding → RGB
             img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
 
         physical_size = (img.width, img.height)

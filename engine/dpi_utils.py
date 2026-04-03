@@ -47,8 +47,10 @@ try:
     else:
         # E_ACCESSDENIED (0x80070005) means it was already set (e.g., via manifest)
         logger.debug("SetProcessDpiAwareness returned HRESULT 0x%08X (may already be set)", hr & 0xFFFFFFFF)
+    _shcore = _shcore_init  # reuse the handle already opened above
 except Exception:  # noqa: BLE001
     logger.warning("Could not set DPI awareness — using process default")
+    _shcore = None
 
 # Module-level cache
 _monitor_map: List[Dict] = []
@@ -67,15 +69,7 @@ _MonitorEnumProc = ctypes.WINFUNCTYPE(
     ctypes.wintypes.LPARAM,  # dwData
 )
 
-_shcore = None
-
 def _get_shcore():
-    global _shcore
-    if _shcore is None:
-        try:
-            _shcore = ctypes.WinDLL("Shcore.dll")
-        except OSError:
-            pass
     return _shcore
 
 

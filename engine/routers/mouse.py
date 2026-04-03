@@ -8,7 +8,9 @@ pyautogui (which operates in physical pixel space).
 
 import asyncio
 import math
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Literal, Optional
 
 import pyautogui
@@ -19,27 +21,39 @@ from engine import dpi_utils
 
 router = APIRouter()
 
+_mouse_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mouse_drag")
+
 # ---------------------------------------------------------------------------
 # Held-state tracking — lets callers detect orphaned mousedown
 # ---------------------------------------------------------------------------
 _held_buttons: set[str] = set()
+_held_buttons_lock = threading.Lock()
 
 
 def get_held_buttons() -> set[str]:
     """Return the set of currently held mouse buttons."""
-    return set(_held_buttons)
+    with _held_buttons_lock:
+        return set(_held_buttons)
 
 
 def release_all_held() -> list[str]:
-    """Release all held mouse buttons. Returns the list of buttons released."""
+    """Release all held mouse buttons. Returns the list of buttons released.
+
+    Note: a concurrent mousedown between the snapshot and the final clear can
+    leave a button physically held but removed from the tracking set. This is
+    acceptable because release_all_held is a recovery tool, not a precision API.
+    """
+    with _held_buttons_lock:
+        buttons_to_release = list(_held_buttons)
     released = []
-    for btn in list(_held_buttons):
+    for btn in buttons_to_release:
         try:
             pyautogui.mouseUp(button=btn)
         except Exception:  # noqa: BLE001
             pass
         released.append(btn)
-    _held_buttons.clear()
+    with _held_buttons_lock:
+        _held_buttons.clear()
     return released
 
 
@@ -52,7 +66,7 @@ class MouseRequest(BaseModel):
     action: Literal["move", "click", "double_click", "drag", "scroll", "mousedown", "mouseup"]
     x: Optional[int] = None
     y: Optional[int] = None
-    button: Optional[str] = "left"
+    button: Optional[Literal["left", "right", "middle"]] = "left"
     x2: Optional[int] = None
     y2: Optional[int] = None
     amount: Optional[int] = None
@@ -156,7 +170,8 @@ async def mouse_action(req: MouseRequest):
                 time.sleep(0.1)
                 pyautogui.mouseUp(button=button)
 
-            await asyncio.to_thread(_execute_drag)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(_mouse_executor, _execute_drag)
             return {
                 "success": True,
                 "data": {
@@ -189,7 +204,8 @@ async def mouse_action(req: MouseRequest):
             button = req.button or "left"
             pyautogui.moveTo(phys_x, phys_y)
             pyautogui.mouseDown(button=button)
-            _held_buttons.add(button)
+            with _held_buttons_lock:
+                _held_buttons.add(button)
             return {
                 "success": True,
                 "data": {"pressed_at": {"x": phys_x, "y": phys_y}, "button": button},
@@ -206,7 +222,8 @@ async def mouse_action(req: MouseRequest):
                 phys_x, phys_y, _ = dpi_utils.logical_to_physical(req.x, req.y, monitor_map)
                 pyautogui.moveTo(phys_x, phys_y)
             pyautogui.mouseUp(button=button)
-            _held_buttons.discard(button)
+            with _held_buttons_lock:
+                _held_buttons.discard(button)
             return {
                 "success": True,
                 "data": {"button": button},

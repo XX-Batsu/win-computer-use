@@ -174,6 +174,13 @@ async def delete_desktop(index: int):
                 "error": f"Desktop index {index} out of range (0–{count - 1})",
                 "timed_out": False,
             }
+        if count <= 1:
+            return {
+                "success": False,
+                "data": None,
+                "error": "Cannot delete the last desktop",
+                "timed_out": False,
+            }
         VirtualDesktop(index + 1).remove()
         return {
             "success": True,

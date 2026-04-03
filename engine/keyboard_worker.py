@@ -1,31 +1,22 @@
 """
-keyboard_worker.py — Standalone top-level module for subprocess keyboard input.
-
-Must remain importable by a fresh Python process because Windows multiprocessing
-uses 'spawn'. No closures, no __main__ guard around the worker function.
+keyboard_worker.py — Worker function for threaded keyboard input.
 """
 
-import sys
-from pathlib import Path
-# Ensure engine/ parent is on sys.path for spawn-mode subprocess imports
-_worker_dir = str(Path(__file__).parent)
-if _worker_dir not in sys.path:
-    sys.path.insert(0, _worker_dir)
+import queue
 
-import multiprocessing
 import pyautogui
 
 
-def keyboard_worker(queue: multiprocessing.Queue, action: str, args: dict) -> None:
+def keyboard_worker(q: queue.Queue, action: str, args: dict) -> None:
     """
-    Always puts exactly one item into queue: success result or error sentinel.
+    Always puts exactly one item into q: success result or error sentinel.
     actions: "type", "hotkey", "keydown", "keyup"
     """
     try:
         result = _run_pyautogui(action, args)
-        queue.put({"success": True, "data": result, "error": None, "timed_out": False})
+        q.put({"success": True, "data": result, "error": None, "timed_out": False})
     except Exception as e:
-        queue.put({"success": False, "data": None, "error": str(e), "timed_out": False})
+        q.put({"success": False, "data": None, "error": str(e), "timed_out": False})
 
 
 def _run_pyautogui(action: str, args: dict):
@@ -36,9 +27,34 @@ def _run_pyautogui(action: str, args: dict):
         # For text containing non-ASCII, use clipboard-paste fallback.
         has_non_ascii = any(ord(c) > 126 or (ord(c) < 32 and c not in ('\t', '\n', '\r')) for c in text)
         if has_non_ascii:
-            import pyperclip
-            pyperclip.copy(text)
+            import win32clipboard
+            # Atomically set text on the clipboard (lock held only during set),
+            # then paste via Ctrl+V. Note: a brief race window exists between
+            # CloseClipboard() and the Ctrl+V keypress; eliminating it would
+            # require bypassing the clipboard via SendInput Unicode injection.
+            win32clipboard.OpenClipboard()
+            try:
+                try:
+                    old = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+                except Exception:
+                    # Clipboard was empty or held a non-text format (image, file
+                    # list, etc.). We cannot save/restore those formats, so we
+                    # leave the clipboard with our text after the paste.
+                    old = None
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, text)
+            finally:
+                win32clipboard.CloseClipboard()
             pyautogui.hotkey("ctrl", "v")
+            # Restore original text only if we saved it; if the clipboard held
+            # a non-text format we cannot restore it, so we leave it as-is.
+            if old is not None:
+                win32clipboard.OpenClipboard()
+                try:
+                    win32clipboard.EmptyClipboard()
+                    win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, old)
+                finally:
+                    win32clipboard.CloseClipboard()
         else:
             pyautogui.typewrite(text, interval=interval)
         return None
