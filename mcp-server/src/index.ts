@@ -11,12 +11,12 @@ import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import {
-  SCREENSHOT_MAX_W,
-  SCREENSHOT_MAX_H,
-  toLogicalPos,
-  toLogicalDimCoord,
-  toImageCoord,
-} from "./coords.js";
+  registerScreenshot,
+  resolveCoords,
+  resolveDim,
+  lookupTransform,
+  type ScreenshotTransform,
+} from "./registry.js";
 
 // ── Config resolution ────────────────────────────────────────────────────────
 
@@ -117,9 +117,6 @@ interface ZoomData {
   virtual_origin: unknown;
 }
 
-// NOTE: must never update cropOffset or imageScale — see P2 Key Constraint.
-// handleTool is the only path that may update coordinate state.
-// Any refactor that routes the verification zoom through handleTool is a bug.
 async function fetchZoomRaw(logicalX: number, logicalY: number): Promise<EngineResponse<ZoomData>> {
   return enginePost<ZoomData>("/screenshot/zoom", {
     x: logicalX,
@@ -162,98 +159,71 @@ function textContent(text: string): { content: TextContent[] } {
   return { content: [{ type: "text", text }] };
 }
 
+// ── Arg coercion ─────────────────────────────────────────────────────────────
+// MCP tool call arguments arrive as `unknown`. TypeScript's `as number` is a
+// compile-time assertion only — it does NOT convert a string at runtime.
+// Claude occasionally sends numeric coordinates as JSON strings (e.g. "200"
+// instead of 200), which causes `"200" + offset` to concatenate instead of add.
+// numArg() converts to a JS number so all downstream math stays numeric.
+function numArg(v: unknown): number {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
 // ── Coordinate remapping ────────────────────────────────────────────────────
-// Coordinates in tool arguments are always in "current screenshot image pixels".
-// The MCP layer converts them to logical pixels before sending to the engine.
-//
-// State updated by the screenshot handler after every successful capture:
-//   imageScale        — scale of the last FULL-SCREEN shot (used for initImageScale)
-//   currentImageScale — scale of the last shot (full or crop)
-//   cropOffsetX/Y     — logical-pixel origin of the last crop (0,0 for full-screen)
-
-let imageScale = 1.0;
-let currentImageScale = 1.0;
-let cropOffsetX = 0;
-let cropOffsetY = 0;
-
-/** X position: scale by currentImageScale then add crop offset. */
-function toLogicalX(v: number): number { return toLogicalPos(v, currentImageScale, cropOffsetX); }
-/** Y position: scale by currentImageScale then add crop offset. */
-function toLogicalY(v: number): number { return toLogicalPos(v, currentImageScale, cropOffsetY); }
-/** Dimension: scale by currentImageScale, no offset. */
-function toLogicalDim(v: number): number { return toLogicalDimCoord(v, currentImageScale); }
-/** Logical X → current screenshot image pixels. */
-function toImageCurrentX(v: number): number { return toImageCoord(v, currentImageScale, cropOffsetX); }
-/** Logical Y → current screenshot image pixels. */
-function toImageCurrentY(v: number): number { return toImageCoord(v, currentImageScale, cropOffsetY); }
+// Coordinates in tool arguments are in "screenshot image pixels" of the referenced
+// screenshot. The MCP layer uses the screenshot registry (resolveCoords / resolveDim)
+// to convert them to logical pixels before sending to the engine.
 
 
-/** Remap bounding_rect and center in element data from logical → current-screenshot image coords.
- *  Recurses into all object properties so nested structures (e.g. find_element's
- *  {elements: [{center, bounding_rect}, ...]} ) are correctly transformed. */
-function remapElementCoords(data: unknown): unknown {
+/**
+ * Remap bounding_rect and center in element data from logical → image pixels.
+ * When transform is provided, converts logical coords to image pixels of that screenshot.
+ * When undefined (find_element called without screenshot_id), returns logical coords as-is.
+ */
+function remapElementCoords(data: unknown, t?: ScreenshotTransform): unknown {
   if (data === null || typeof data !== "object") return data;
-  if (Array.isArray(data)) return (data as unknown[]).map(remapElementCoords);
+  if (Array.isArray(data)) return (data as unknown[]).map(item => remapElementCoords(item, t));
   const obj = data as Record<string, unknown>;
   const result: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(obj)) {
     if (key === "center" && val !== null && typeof val === "object" && !Array.isArray(val)) {
       const c = val as { x: number; y: number };
-      result.center = { x: toImageCurrentX(c.x), y: toImageCurrentY(c.y) };
+      if (t) {
+        result.center = {
+          x: t.scale === 1.0 ? c.x - t.originX : Math.round((c.x - t.originX) * t.scale),
+          y: t.scale === 1.0 ? c.y - t.originY : Math.round((c.y - t.originY) * t.scale),
+        };
+      } else {
+        result.center = c; // no transform: return logical coords as-is
+      }
     } else if (key === "bounding_rect" && val !== null && typeof val === "object" && !Array.isArray(val)) {
       const r = val as { left: number; top: number; right: number; bottom: number };
-      result.bounding_rect = {
-        left:   toImageCurrentX(r.left),
-        top:    toImageCurrentY(r.top),
-        right:  toImageCurrentX(r.right),
-        bottom: toImageCurrentY(r.bottom),
-      };
+      if (t) {
+        result.bounding_rect = {
+          left:   t.scale === 1.0 ? r.left   - t.originX : Math.round((r.left   - t.originX) * t.scale),
+          top:    t.scale === 1.0 ? r.top    - t.originY : Math.round((r.top    - t.originY) * t.scale),
+          right:  t.scale === 1.0 ? r.right  - t.originX : Math.round((r.right  - t.originX) * t.scale),
+          bottom: t.scale === 1.0 ? r.bottom - t.originY : Math.round((r.bottom - t.originY) * t.scale),
+        };
+      } else {
+        result.bounding_rect = r; // no transform: return logical coords as-is
+      }
     } else {
-      result[key] = remapElementCoords(val);
+      result[key] = remapElementCoords(val, t);
     }
   }
   return result;
 }
 
-/** Initialize imageScale at startup from /screen-info. Non-fatal on failure.
- *  Uses a manual fetch with AbortController timeout instead of engineGet()
- *  because engineGet() does not support per-call timeouts. */
-async function initImageScale(): Promise<void> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3000);
-  try {
-    const res = await fetch(`${ENGINE_URL}/screen-info`, {
-      method: "GET",
-      headers: authHeaders(),
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    const body = (await res.json()) as EngineResponse<{ logical_width: number; logical_height: number }>;
-    if (body.success) {
-      const { logical_width: lw, logical_height: lh } = body.data;
-      if (lw > 0 && lh > 0 && (lw > SCREENSHOT_MAX_W || lh > SCREENSHOT_MAX_H)) {
-        imageScale = Math.min(SCREENSHOT_MAX_W / lw, SCREENSHOT_MAX_H / lh);
-      }
-      currentImageScale = imageScale;
-      console.error(`imageScale initialized: ${imageScale.toFixed(4)} (screen ${lw}×${lh} logical)`);
-    } else {
-      console.error(`WARNING: initImageScale — engine returned success=false: ${body.error ?? "unknown"}`);
-    }
-  } catch (err) {
-    clearTimeout(timer);
-    const msg = (err as Error).name === "AbortError"
-      ? "timed out after 3s"
-      : (err as Error).message;
-    console.error(`WARNING: initImageScale failed (${msg}) — imageScale stays 1.0`);
-  }
-}
 
 // ── Tool definitions ─────────────────────────────────────────────────────────
 
 const COORD_NOTE =
-  "All coordinates are in screenshot pixels (mapped automatically to logical pixels). " +
-  "IMPORTANT: coordinates are only valid from the most recent screenshot — any new " +
-  "screenshot (including crops and zooms) invalidates coordinates from earlier screenshots.";
+  "All coordinates are in screenshot image pixels of the referenced screenshot. " +
+  "REQUIRED: pass the screenshot_id returned by the screenshot tool that produced the image " +
+  "you are reading coordinates from. Using the wrong screenshot_id will cause the click to " +
+  "land in the wrong place.";
 
 export const TOOLS: Tool[] = [
   {
@@ -276,6 +246,10 @@ export const TOOLS: Tool[] = [
         left:   { type: "number", description: "Left edge of capture region in screenshot pixels (requires width+height)" },
         width:  { type: "number", description: "Width of capture region in screenshot pixels (must be paired with height)" },
         height: { type: "number", description: "Height of capture region in screenshot pixels (must be paired with width)" },
+        screenshot_id: {
+          type: "string",
+          description: "Required when taking a crop (width+height provided). ID of the screenshot from which left/top/width/height were read.",
+        },
       },
     },
   },
@@ -303,8 +277,12 @@ export const TOOLS: Tool[] = [
         width:    { type: "number",  description: "Crop width in screenshot pixels (default 200)" },
         height:   { type: "number",  description: "Crop height in screenshot pixels (default 200)" },
         annotate: { type: "boolean", description: "Draw filled dot at center (default true)" },
+        screenshot_id: {
+          type: "string",
+          description: "ID of the screenshot from which x,y coordinates were read.",
+        },
       },
-      required: ["x", "y"],
+      required: ["x", "y", "screenshot_id"],
     },
   },
   {
@@ -350,8 +328,12 @@ export const TOOLS: Tool[] = [
         left:   { type: "number", description: "Left edge of crop region in screenshot pixels" },
         width:  { type: "number", description: "Width of crop region in screenshot pixels" },
         height: { type: "number", description: "Height of crop region in screenshot pixels" },
+        screenshot_id: {
+          type: "string",
+          description: "ID of the screenshot from which annotation coordinates were read.",
+        },
       },
-      required: ["annotations"],
+      required: ["annotations", "screenshot_id"],
     },
   },
   {
@@ -362,8 +344,12 @@ export const TOOLS: Tool[] = [
       properties: {
         x: { type: "number", description: "X coordinate in screenshot pixels" },
         y: { type: "number", description: "Y coordinate in screenshot pixels" },
+        screenshot_id: {
+          type: "string",
+          description: "ID returned by the screenshot tool that produced the image you are clicking on. Required.",
+        },
       },
-      required: ["x", "y"],
+      required: ["x", "y", "screenshot_id"],
     },
   },
   {
@@ -379,8 +365,12 @@ export const TOOLS: Tool[] = [
           enum: ["left", "right", "middle"],
           description: "Mouse button to click (default: left)",
         },
+        screenshot_id: {
+          type: "string",
+          description: "ID returned by the screenshot tool that produced the image you are clicking on. Required.",
+        },
       },
-      required: ["x", "y"],
+      required: ["x", "y", "screenshot_id"],
     },
   },
   {
@@ -396,8 +386,12 @@ export const TOOLS: Tool[] = [
           enum: ["left", "right", "middle"],
           description: "Mouse button to double-click (default: left)",
         },
+        screenshot_id: {
+          type: "string",
+          description: "ID returned by the screenshot tool that produced the image you are clicking on. Required.",
+        },
       },
-      required: ["x", "y"],
+      required: ["x", "y", "screenshot_id"],
     },
   },
   {
@@ -430,8 +424,12 @@ export const TOOLS: Tool[] = [
           },
           description: "Optional intermediate waypoints in screenshot pixels. Mouse follows (x1,y1) → waypoints[0] → ... → (x2,y2) without releasing the button. Empty array treated same as omitting.",
         },
+        screenshot_id: {
+          type: "string",
+          description: "ID returned by the screenshot tool that produced the image you are reading drag coordinates from. Required.",
+        },
       },
-      required: ["x1", "y1", "x2", "y2"],
+      required: ["x1", "y1", "x2", "y2", "screenshot_id"],
     },
   },
   {
@@ -447,8 +445,12 @@ export const TOOLS: Tool[] = [
           enum: ["left", "right", "middle"],
           description: "Mouse button to press and hold (default: left)",
         },
+        screenshot_id: {
+          type: "string",
+          description: "ID returned by the screenshot tool that produced the image you are clicking on. Required.",
+        },
       },
-      required: ["x", "y"],
+      required: ["x", "y", "screenshot_id"],
     },
   },
   {
@@ -463,6 +465,10 @@ export const TOOLS: Tool[] = [
           type: "string",
           enum: ["left", "right", "middle"],
           description: "Mouse button to release (default: left)",
+        },
+        screenshot_id: {
+          type: "string",
+          description: "Required if providing x and y coordinates. ID of the screenshot from which the coordinates were read.",
         },
       },
       required: [],
@@ -480,8 +486,12 @@ export const TOOLS: Tool[] = [
           type: "integer",
           description: "Scroll wheel notches (integer): positive = up, negative = down",
         },
+        screenshot_id: {
+          type: "string",
+          description: "ID returned by the screenshot tool that produced the image you are clicking on. Required.",
+        },
       },
-      required: ["x", "y", "amount"],
+      required: ["x", "y", "amount", "screenshot_id"],
     },
   },
   {
@@ -748,8 +758,12 @@ export const TOOLS: Tool[] = [
       properties: {
         x: { type: "number", description: "X coordinate in screenshot pixels" },
         y: { type: "number", description: "Y coordinate in screenshot pixels" },
+        screenshot_id: {
+          type: "string",
+          description: "ID returned by the screenshot tool that produced the image you are clicking on. Required.",
+        },
       },
-      required: ["x", "y"],
+      required: ["x", "y", "screenshot_id"],
     },
   },
 ];
@@ -770,16 +784,33 @@ export async function handleTool(
       case "screenshot": {
         const isCrop = args.width !== undefined && args.height !== undefined;
         const body: Record<string, unknown> = {};
+        let logicalLeft = 0, logicalTop = 0;
 
-        // Convert input args from current-screenshot image pixels to logical pixels.
-        // toLogicalX/Y apply the active crop offset, so nested crops work correctly.
-        const logicalLeft = args.left !== undefined ? toLogicalX(args.left as number) : 0;
-        const logicalTop  = args.top  !== undefined ? toLogicalY(args.top  as number) : 0;
-        if (args.left   !== undefined) body.left   = logicalLeft;
-        if (args.top    !== undefined) body.top    = logicalTop;
-        if (args.width  !== undefined) body.width  = toLogicalDim(args.width  as number);
-        if (args.height !== undefined) body.height = toLogicalDim(args.height as number);
-        if (!isCrop) body.ruler = true;
+        if (isCrop) {
+          const screenshotId = args.screenshot_id as string | undefined;
+          if (!screenshotId) {
+            return errorContent(
+              "screenshot_id is required when taking a crop screenshot. " +
+              "Take a full-screen screenshot first to get a valid ID."
+            );
+          }
+          const t = lookupTransform(screenshotId);
+          if (!t) {
+            return errorContent(`screenshot: Screenshot ID '${screenshotId}' not found. Take a new screenshot first.`);
+          }
+          if (args.left !== undefined) {
+            logicalLeft = t.originX + (t.scale === 1.0 ? numArg(args.left) : Math.round(numArg(args.left) / t.scale));
+            body.left = logicalLeft;
+          }
+          if (args.top !== undefined) {
+            logicalTop = t.originY + (t.scale === 1.0 ? numArg(args.top) : Math.round(numArg(args.top) / t.scale));
+            body.top = logicalTop;
+          }
+          body.width  = resolveDim(args.width  as number | string, screenshotId);
+          body.height = resolveDim(args.height as number | string, screenshotId);
+        } else {
+          body.ruler = true;
+        }
 
         const resp = await enginePost<{
           image: string;
@@ -796,36 +827,37 @@ export async function handleTool(
           return errorContent(`screenshot failed: ${resp.error ?? "unknown error"}`);
         }
 
-        if (isCrop) {
-          // Store where this crop sits in full-screen logical space.
-          // Use logicalLeft/Top (already converted) — not raw image-pixel args.
-          cropOffsetX = logicalLeft;
-          cropOffsetY = logicalTop;
-          currentImageScale = resp.data.image_scale;
-          // imageScale (full-screen scale) intentionally NOT updated.
-        } else {
-          imageScale = resp.data.image_scale;
-          cropOffsetX = 0;
-          cropOffsetY = 0;
-          currentImageScale = resp.data.image_scale;
-        }
-
         const [lw, lh] = resp.data.logical_size;
         const [iw, ih] = resp.data.image_size;
         const [pw, ph] = resp.data.physical_size;
 
+        // Register in screenshot registry
+        const transform: ScreenshotTransform = {
+          originX: logicalLeft,
+          originY: logicalTop,
+          scale: resp.data.image_scale,
+          contentW: lw,
+          contentH: lh,
+        };
+        const screenshotId = registerScreenshot(transform);
+        const idLine =
+          `Screenshot ID: ${screenshotId} | origin=(${logicalLeft},${logicalTop}) ` +
+          `scale=${resp.data.image_scale.toFixed(2)} content=${lw}\u00d7${lh}`;
+
         let meta: string;
         if (isCrop) {
           meta =
+            `${idLine}\n` +
             `Screenshot: ${iw}\u00d7${ih} image pixels (logical ${lw}\u00d7${lh}, physical ${pw}\u00d7${ph}, ` +
             `DPI scale ${resp.data.dpi_scale}, image scale ${resp.data.image_scale.toFixed(4)}). ` +
-            `Crop origin: logical (${cropOffsetX}, ${cropOffsetY}). Coordinates from this image are in crop-relative image pixels, automatically remapped.`;
+            `Crop origin: logical (${logicalLeft}, ${logicalTop}). Coordinates from this image are in crop-relative image pixels, automatically remapped.`;
         } else {
           const rulerWidth = resp.data.ruler_width ?? 0;
           const rulerHeight = resp.data.ruler_height ?? 0;
           const contentW = iw - rulerWidth;
           const contentH = ih - rulerHeight;
           meta =
+            `${idLine}\n` +
             `Screenshot: content ${contentW}\u00d7${contentH} image pixels (full image ${iw}\u00d7${ih} includes ruler strips, ` +
             `logical ${lw}\u00d7${lh}, physical ${pw}\u00d7${ph}, DPI scale ${resp.data.dpi_scale}, ` +
             `image scale ${resp.data.image_scale.toFixed(4)}). ` +
@@ -833,23 +865,31 @@ export async function handleTool(
             `Use image pixel coordinates from the content area only (x: 0\u2013${contentW - 1}, y: 0\u2013${contentH - 1}); the ruler strips are not click targets and must not be used as coordinate sources.`;
         }
 
-        const metaContent: TextContent = { type: "text", text: meta };
-        const imageContent: ImageContent = {
-          type: "image",
-          data: resp.data.image,
-          mimeType: "image/png",
+        return {
+          content: [
+            { type: "text", text: meta } as TextContent,
+            { type: "image", data: resp.data.image, mimeType: "image/png" } as ImageContent,
+          ],
         };
-        return { content: [metaContent, imageContent] };
       }
 
       // ── Screenshot zoom ─────────────────────────────────────────────────
       case "screenshot_zoom": {
-        const logicalX = toLogicalX(args.x as number);
-        const logicalY = toLogicalY(args.y as number);
-        const inputW = (args.width as number | undefined) ?? 200;
-        const inputH = (args.height as number | undefined) ?? 200;
-        const logicalW = toLogicalDim(inputW);
-        const logicalH = toLogicalDim(inputH);
+        const screenshotId = args.screenshot_id as string | undefined;
+        if (!screenshotId) {
+          return errorContent(
+            "screenshot_id is required for screenshot_zoom. " +
+            "Take a screenshot first to get a valid ID."
+          );
+        }
+        let logicalX: number, logicalY: number, logicalW: number, logicalH: number;
+        try {
+          const coords = resolveCoords(args.x as number | string, args.y as number | string, screenshotId);
+          logicalX = coords.logicalX;
+          logicalY = coords.logicalY;
+          logicalW = resolveDim(args.width !== undefined ? args.width as number | string : 200, screenshotId);
+          logicalH = resolveDim(args.height !== undefined ? args.height as number | string : 200, screenshotId);
+        } catch (e) { return errorContent((e as Error).message); }
 
         const zoomBody = {
           x: logicalX,
@@ -873,20 +913,40 @@ export async function handleTool(
           return errorContent(`screenshot_zoom failed: ${resp.error ?? "unknown error"}`);
         }
 
-        // Update crop state so subsequent coordinate inputs (in zoom image pixels) convert correctly.
-        // imageScale (full-screen scale) is intentionally NOT updated — same rule as screenshot crops.
-        cropOffsetX = logicalX - Math.floor(logicalW / 2);
-        cropOffsetY = logicalY - Math.floor(logicalH / 2);
-        currentImageScale = resp.data.image_scale;
+        const cropOriginX = logicalX - Math.floor(logicalW / 2);
+        const cropOriginY = logicalY - Math.floor(logicalH / 2);
 
         const [lw, lh] = resp.data.logical_size;
         const [iw, ih] = resp.data.image_size;
         const [pw, ph] = resp.data.physical_size;
+
+        // Register new screenshot_id for this zoom
+        const newTransform: ScreenshotTransform = {
+          originX: cropOriginX,
+          originY: cropOriginY,
+          scale: resp.data.image_scale,
+          contentW: lw,
+          contentH: lh,
+        };
+        const newId = registerScreenshot(newTransform);
+        const idLine =
+          `Screenshot ID: ${newId} | origin=(${cropOriginX},${cropOriginY}) ` +
+          `scale=${resp.data.image_scale.toFixed(2)} content=${lw}\u00d7${lh}`;
+
+        const fxFormula = (lw === iw)
+          ? `${cropOriginX} + zoom_x`
+          : `${cropOriginX} + round(zoom_x \u00d7 ${lw}/${iw})`;
+        const fyFormula = (lh === ih)
+          ? `${cropOriginY} + zoom_y`
+          : `${cropOriginY} + round(zoom_y \u00d7 ${lh}/${ih})`;
         const meta =
+          `${idLine}\n` +
           `Zoom screenshot (${iw}\u00d7${ih} image pixels, logical ${lw}\u00d7${lh}, physical ${pw}\u00d7${ph}, ` +
           `DPI scale ${resp.data.dpi_scale}, image scale ${resp.data.image_scale.toFixed(4)}). ` + // NOTE: this exact format is used as a structural anchor in P1 — do not change without updating the P1 insertion logic.
-          `Crop origin: logical (${cropOffsetX}, ${cropOffsetY}). ` +
-          `Coordinates from this image are relative to the zoomed region.`;
+          `Crop origin: logical (${cropOriginX}, ${cropOriginY}).\n` +
+          `To convert zoom-image coordinates to full-screen logical:\n` +
+          `  full_x = ${fxFormula}\n` +
+          `  full_y = ${fyFormula}`;
 
         return {
           content: [
@@ -906,18 +966,26 @@ export async function handleTool(
           radius?: number;
         }
 
-        const annotations = (args.annotations as AnnotationInput[]).map(a => ({
-          ...a,
-          x: toLogicalX(a.x),
-          y: toLogicalY(a.y),
-          // radius is NOT converted — it is a drawing size in image pixels, not a screen coord
-        }));
-
+        const annotScreenshotId = args.screenshot_id as string | undefined;
+        if (!annotScreenshotId) {
+          return errorContent(
+            "screenshot_id is required for screenshot_annotate. " +
+            "Take a screenshot first to get a valid ID."
+          );
+        }
+        const annotations = (args.annotations as AnnotationInput[]).map(a => {
+          const c = resolveCoords(numArg(a.x), numArg(a.y), annotScreenshotId);
+          return { ...a, x: c.logicalX, y: c.logicalY };
+        });
         const body: Record<string, unknown> = { annotations };
-        if (args.top    !== undefined) body.top    = toLogicalY(args.top    as number);
-        if (args.left   !== undefined) body.left   = toLogicalX(args.left   as number);
-        if (args.width  !== undefined) body.width  = toLogicalDim(args.width  as number);
-        if (args.height !== undefined) body.height = toLogicalDim(args.height as number);
+        // Convert crop params using registry transform
+        const t = lookupTransform(annotScreenshotId);
+        if (t) {
+          if (args.top    !== undefined) body.top    = t.originY + (t.scale === 1.0 ? numArg(args.top)    : Math.round(numArg(args.top)    / t.scale));
+          if (args.left   !== undefined) body.left   = t.originX + (t.scale === 1.0 ? numArg(args.left)   : Math.round(numArg(args.left)   / t.scale));
+          if (args.width  !== undefined) body.width  = t.scale === 1.0 ? numArg(args.width)  : Math.round(numArg(args.width)  / t.scale);
+          if (args.height !== undefined) body.height = t.scale === 1.0 ? numArg(args.height) : Math.round(numArg(args.height) / t.scale);
+        }
 
         const resp = await enginePost<{
           image: string;
@@ -934,14 +1002,18 @@ export async function handleTool(
           return errorContent(`screenshot_annotate failed: ${resp.error ?? "unknown error"}`);
         }
 
-        // screenshot_annotate does NOT update crop state — it is a verification tool,
-        // not a navigation tool. The user still needs to act on the original coordinate space.
-
+        // screenshot_annotate does NOT update crop state — it is a verification tool.
         const [lw, lh] = resp.data.logical_size;
         const [iw, ih] = resp.data.image_size;
         const skipped = resp.data.skipped_annotations;
+
+        // Return same screenshot_id — coordinate space unchanged.
+        // The shorter format (no origin/scale/content) is intentional: annotate does not
+        // register a new transform, so there is no new metadata to report. The original
+        // screenshot's transform is still in the registry under the same ID.
+        const idPrefix = annotScreenshotId ? `Screenshot ID: ${annotScreenshotId}\n` : "";
         let meta =
-          `Annotated screenshot: ${iw}\u00d7${ih} image pixels (logical ${lw}\u00d7${lh}, ` +
+          `${idPrefix}Annotated screenshot: ${iw}\u00d7${ih} image pixels (logical ${lw}\u00d7${lh}, ` +
           `image scale ${resp.data.image_scale.toFixed(4)}).`;
         if (skipped.length > 0) {
           meta += ` WARNING: annotations at indices [${skipped.join(", ")}] were outside the image bounds — re-check those coordinates.`;
@@ -957,18 +1029,36 @@ export async function handleTool(
 
       // ── Mouse ────────────────────────────────────────────────────────────
       case "mouse_move": {
-        const resp = await enginePost("/mouse", {
-          action: "move",
-          x: toLogicalX(args.x as number),
-          y: toLogicalY(args.y as number),
-        });
+        const screenshotId = args.screenshot_id as string | undefined;
+        if (!screenshotId) {
+          return errorContent(
+            "screenshot_id is required. Call screenshot, screenshot_zoom, or screenshot_annotate first to get a valid ID."
+          );
+        }
+        let logicalX: number, logicalY: number;
+        try {
+          ({ logicalX, logicalY } = resolveCoords(args.x as number | string, args.y as number | string, screenshotId));
+        } catch (e) {
+          return errorContent((e as Error).message);
+        }
+        const resp = await enginePost("/mouse", { action: "move", x: logicalX, y: logicalY });
         if (!resp.success) return errorContent(`mouse_move failed: ${resp.error}`);
         return textContent("Mouse moved.");
       }
 
       case "mouse_click": {
-        const logicalX = toLogicalX(args.x as number);
-        const logicalY = toLogicalY(args.y as number);
+        const screenshotId = args.screenshot_id as string | undefined;
+        if (!screenshotId) {
+          return errorContent(
+            "screenshot_id is required. Call screenshot, screenshot_zoom, or screenshot_annotate first to get a valid ID."
+          );
+        }
+        let logicalX: number, logicalY: number;
+        try {
+          ({ logicalX, logicalY } = resolveCoords(args.x as number | string, args.y as number | string, screenshotId));
+        } catch (e) {
+          return errorContent((e as Error).message);
+        }
         const clickResp = await enginePost("/mouse", {
           action: "click",
           x: logicalX,
@@ -996,8 +1086,18 @@ export async function handleTool(
       }
 
       case "mouse_double_click": {
-        const logicalX = toLogicalX(args.x as number);
-        const logicalY = toLogicalY(args.y as number);
+        const screenshotId = args.screenshot_id as string | undefined;
+        if (!screenshotId) {
+          return errorContent(
+            "screenshot_id is required. Call screenshot, screenshot_zoom, or screenshot_annotate first to get a valid ID."
+          );
+        }
+        let logicalX: number, logicalY: number;
+        try {
+          ({ logicalX, logicalY } = resolveCoords(args.x as number | string, args.y as number | string, screenshotId));
+        } catch (e) {
+          return errorContent((e as Error).message);
+        }
         const clickResp = await enginePost("/mouse", {
           action: "double_click",
           x: logicalX,
@@ -1025,22 +1125,30 @@ export async function handleTool(
       }
 
       case "mouse_drag": {
-        const body: Record<string, unknown> = {
-          action: "drag",
-          x: toLogicalX(args.x1 as number),
-          y: toLogicalY(args.y1 as number),
-          x2: toLogicalX(args.x2 as number),
-          y2: toLogicalY(args.y2 as number),
-        };
-        if (args.button !== undefined) body.button = args.button;
-        if (args.duration !== undefined) body.duration = args.duration;
+        const screenshotId = args.screenshot_id as string | undefined;
+        if (!screenshotId) {
+          return errorContent(
+            "screenshot_id is required. Call screenshot, screenshot_zoom, or screenshot_annotate first to get a valid ID."
+          );
+        }
+        let lx1: number, ly1: number, lx2: number, ly2: number;
+        try {
+          ({ logicalX: lx1, logicalY: ly1 } = resolveCoords(args.x1 as number | string, args.y1 as number | string, screenshotId));
+          ({ logicalX: lx2, logicalY: ly2 } = resolveCoords(args.x2 as number | string, args.y2 as number | string, screenshotId));
+        } catch (e) { return errorContent((e as Error).message); }
+        const body: Record<string, unknown> = { action: "drag", x: lx1, y: ly1, x2: lx2, y2: ly2 };
+        if (args.button    !== undefined) body.button     = args.button;
+        if (args.duration  !== undefined) body.duration   = args.duration;
         if (args.hold_before !== undefined) body.hold_before = args.hold_before;
-        if (args.steps !== undefined) body.steps = args.steps;
+        if (args.steps     !== undefined) body.steps      = args.steps;
         if (args.waypoints !== undefined) {
-          body.waypoints = (args.waypoints as Array<{ x: number; y: number }>).map(wp => ({
-            x: toLogicalX(wp.x),
-            y: toLogicalY(wp.y),
-          }));
+          // Use resolveCoords for each waypoint — consistent with start/end coord handling above.
+          try {
+            body.waypoints = (args.waypoints as Array<{ x: number; y: number }>).map(wp => {
+              const { logicalX, logicalY } = resolveCoords(wp.x, wp.y, screenshotId);
+              return { x: logicalX, y: logicalY };
+            });
+          } catch (e) { return errorContent((e as Error).message); }
         }
         const resp = await enginePost("/mouse", body);
         if (!resp.success) return errorContent(`mouse_drag failed: ${resp.error}`);
@@ -1048,12 +1156,19 @@ export async function handleTool(
       }
 
       case "mouse_down": {
-        const resp = await enginePost("/mouse", {
-          action: "mousedown",
-          x: toLogicalX(args.x as number),
-          y: toLogicalY(args.y as number),
-          button: args.button ?? "left",
-        });
+        const screenshotId = args.screenshot_id as string | undefined;
+        if (!screenshotId) {
+          return errorContent(
+            "screenshot_id is required. Call screenshot, screenshot_zoom, or screenshot_annotate first to get a valid ID."
+          );
+        }
+        let logicalX: number, logicalY: number;
+        try {
+          ({ logicalX, logicalY } = resolveCoords(args.x as number | string, args.y as number | string, screenshotId));
+        } catch (e) {
+          return errorContent((e as Error).message);
+        }
+        const resp = await enginePost("/mouse", { action: "mousedown", x: logicalX, y: logicalY, button: args.button ?? "left" });
         if (!resp.success) return errorContent(`mouse_down failed: ${resp.error}`);
         return textContent("Mouse button pressed.");
       }
@@ -1064,13 +1179,17 @@ export async function handleTool(
         if (hasX !== hasY) {
           return errorContent("mouse_up: x and y must be provided together — one without the other is invalid.");
         }
-        const body: Record<string, unknown> = {
-          action: "mouseup",
-          button: args.button ?? "left",
-        };
+        const body: Record<string, unknown> = { action: "mouseup", button: args.button ?? "left" };
         if (hasX && hasY) {
-          body.x = toLogicalX(args.x as number);
-          body.y = toLogicalY(args.y as number);
+          const screenshotId = args.screenshot_id as string | undefined;
+          if (!screenshotId) {
+            return errorContent("screenshot_id is required when providing x and y coordinates to mouse_up.");
+          }
+          try {
+            const { logicalX, logicalY } = resolveCoords(args.x as number | string, args.y as number | string, screenshotId);
+            body.x = logicalX;
+            body.y = logicalY;
+          } catch (e) { return errorContent((e as Error).message); }
         }
         const resp = await enginePost("/mouse", body);
         if (!resp.success) return errorContent(`mouse_up failed: ${resp.error}`);
@@ -1078,12 +1197,19 @@ export async function handleTool(
       }
 
       case "mouse_scroll": {
-        const resp = await enginePost("/mouse", {
-          action: "scroll",
-          x: toLogicalX(args.x as number),
-          y: toLogicalY(args.y as number),
-          amount: args.amount,
-        });
+        const screenshotId = args.screenshot_id as string | undefined;
+        if (!screenshotId) {
+          return errorContent(
+            "screenshot_id is required. Call screenshot, screenshot_zoom, or screenshot_annotate first to get a valid ID."
+          );
+        }
+        let logicalX: number, logicalY: number;
+        try {
+          ({ logicalX, logicalY } = resolveCoords(args.x as number | string, args.y as number | string, screenshotId));
+        } catch (e) {
+          return errorContent((e as Error).message);
+        }
+        const resp = await enginePost("/mouse", { action: "scroll", x: logicalX, y: logicalY, amount: args.amount });
         if (!resp.success) return errorContent(`mouse_scroll failed: ${resp.error}`);
         return textContent("Mouse scrolled.");
       }
@@ -1228,17 +1354,26 @@ export async function handleTool(
         if (args.timeout !== undefined) body.timeout = args.timeout;
         const resp = await enginePost<unknown>("/find_element", body);
         if (!resp.success) return errorContent(`find_element failed: ${resp.error}`);
-        return textContent(JSON.stringify(remapElementCoords(resp.data), null, 2));
+        const findScreenshotId = args.screenshot_id as string | undefined;
+        const findT = findScreenshotId !== undefined ? lookupTransform(findScreenshotId) : undefined;
+        return textContent(JSON.stringify(remapElementCoords(resp.data, findT), null, 2));
       }
 
       case "element_at": {
-        const resp = await enginePost<unknown>("/element_at", {
-          x: toLogicalX(args.x as number),
-          y: toLogicalY(args.y as number),
-        });
+        const screenshotId = args.screenshot_id as string | undefined;
+        if (!screenshotId) {
+          return errorContent(
+            "screenshot_id is required. Call screenshot, screenshot_zoom, or screenshot_annotate first to get a valid ID."
+          );
+        }
+        let lx: number, ly: number;
+        try { ({ logicalX: lx, logicalY: ly } = resolveCoords(args.x as number | string, args.y as number | string, screenshotId)); }
+        catch (e) { return errorContent((e as Error).message); }
+        const resp = await enginePost<unknown>("/element_at", { x: lx, y: ly });
         if (!resp.success) return errorContent(`element_at failed: ${resp.error}`);
         if (resp.data === null) return textContent(resp.error ?? "No element found at this coordinate.");
-        return textContent(JSON.stringify(remapElementCoords(resp.data), null, 2));
+        const t = lookupTransform(screenshotId);
+        return textContent(JSON.stringify(remapElementCoords(resp.data, t), null, 2));
       }
 
       default:
@@ -1271,6 +1406,5 @@ if (!ENGINE_SECRET) {
   console.error("WARNING: ENGINE_SECRET is not set. All requests to the engine will fail with 401.");
 }
 
-await initImageScale();
 const transport = new StdioServerTransport();
 await server.connect(transport);
