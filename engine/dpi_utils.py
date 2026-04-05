@@ -65,9 +65,22 @@ _MonitorEnumProc = ctypes.WINFUNCTYPE(
     ctypes.c_bool,
     ctypes.c_void_p,  # HMONITOR (pointer-sized handle)
     ctypes.c_void_p,  # HDC (pointer-sized handle)
-    ctypes.POINTER(ctypes.wintypes.RECT),  # lprcMonitor (logical coords)
+    ctypes.POINTER(ctypes.wintypes.RECT),  # lprcMonitor (physical coords when called under PMA_V2)
     ctypes.wintypes.LPARAM,  # dwData
 )
+
+# SetThreadDpiAwarenessContext — available on Windows 10 1607+.
+# We call EnumDisplayMonitors under DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 (-4)
+# so the callback rect is guaranteed to be in physical pixels, regardless of the
+# process-level DPI awareness set by the Python interpreter manifest.
+try:
+    _SetThreadDpiAwarenessContext = ctypes.windll.user32.SetThreadDpiAwarenessContext
+    _SetThreadDpiAwarenessContext.restype = ctypes.c_ssize_t
+    _SetThreadDpiAwarenessContext.argtypes = [ctypes.c_ssize_t]
+except AttributeError:
+    _SetThreadDpiAwarenessContext = None  # pre-1607 fallback
+
+_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
 
 def _get_shcore():
     return _shcore
@@ -94,27 +107,6 @@ def _get_monitor_scale(hmonitor: int) -> float:
     return 1.0
 
 
-def _get_physical_rect(hmonitor: int) -> Tuple[int, int] | None:
-    """Return (physical_left, physical_top) for *hmonitor* via MONITORINFO.
-
-    Returns None if GetMonitorInfoW fails so callers can skip the monitor
-    rather than using garbage data from an uninitialised buffer.
-    """
-    info = ctypes.create_string_buffer(40)  # MONITORINFO: cbSize=40
-    ctypes.c_uint.from_buffer(info, 0).value = 40  # cbSize
-    try:
-        result = ctypes.windll.user32.GetMonitorInfoW(hmonitor, info)
-        if not result:
-            logger.warning("GetMonitorInfoW failed for hmonitor=%s", hmonitor)
-            return None
-        # rcMonitor is at offset 4: RECT { left, top, right, bottom } each LONG (4 bytes)
-        left = ctypes.c_long.from_buffer_copy(info, 4).value
-        top  = ctypes.c_long.from_buffer_copy(info, 8).value
-        return left, top
-    except Exception:  # noqa: BLE001
-        return None
-
-
 # ---------------------------------------------------------------------------
 # Map builder
 # ---------------------------------------------------------------------------
@@ -126,33 +118,46 @@ def build_monitor_map() -> List[Dict]:
     Returns a list of dicts with keys:
         logical_left, logical_top, logical_right, logical_bottom,
         physical_left, physical_top, physical_right, physical_bottom, scale
+
+    EnumDisplayMonitors is called under DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    so the callback rect is in physical pixels.  logical coords are derived by
+    dividing physical coords by the per-monitor DPI scale (GetDpiForMonitor / 96).
     """
     entries: List[Dict] = []
 
     def _callback(hmonitor, _hdc, lp_rect, _data):
-        rect = lp_rect.contents
+        rect = lp_rect.contents  # physical pixel rect under PMA_V2 context
         scale = _get_monitor_scale(hmonitor)
-        phys_rect = _get_physical_rect(hmonitor)
-        if phys_rect is None:
-            logger.warning("Skipping monitor hmonitor=%s: could not retrieve physical rect", hmonitor)
-            return True  # continue enumeration; skip this monitor
-        phys_left, phys_top = phys_rect
+
+        phys_left   = rect.left
+        phys_top    = rect.top
+        phys_right  = rect.right
+        phys_bottom = rect.bottom
 
         entries.append({
-            "logical_left":   rect.left,
-            "logical_top":    rect.top,
-            "logical_right":  rect.right,
-            "logical_bottom": rect.bottom,
+            "logical_left":   round(phys_left   / scale),
+            "logical_top":    round(phys_top    / scale),
+            "logical_right":  round(phys_right  / scale),
+            "logical_bottom": round(phys_bottom / scale),
             "physical_left":  phys_left,
             "physical_top":   phys_top,
-            "physical_right":  phys_left + int((rect.right  - rect.left) * scale),
-            "physical_bottom": phys_top  + int((rect.bottom - rect.top)  * scale),
+            "physical_right":  phys_right,
+            "physical_bottom": phys_bottom,
             "scale":          scale,
         })
         return True  # continue enumeration
 
     cb = _MonitorEnumProc(_callback)
-    ctypes.windll.user32.EnumDisplayMonitors(None, None, cb, 0)
+
+    if _SetThreadDpiAwarenessContext is not None:
+        old_ctx = _SetThreadDpiAwarenessContext(_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+        try:
+            ctypes.windll.user32.EnumDisplayMonitors(None, None, cb, 0)
+        finally:
+            _SetThreadDpiAwarenessContext(old_ctx)
+    else:
+        # Fallback for pre-Windows 10 1607: rect may not be physical pixels
+        ctypes.windll.user32.EnumDisplayMonitors(None, None, cb, 0)
 
     if not entries:
         logger.warning("EnumDisplayMonitors returned no monitors; using fallback (1×1 at scale 1.0)")

@@ -114,7 +114,7 @@ interface ZoomData {
   logical_size: [number, number];
   image_size: [number, number];
   physical_size: [number, number];
-  virtual_origin: unknown;
+  virtual_origin: { x: number; y: number };
 }
 
 async function fetchZoomRaw(logicalX: number, logicalY: number): Promise<EngineResponse<ZoomData>> {
@@ -258,9 +258,9 @@ export const TOOLS: Tool[] = [
     description:
       "Crop a close-up screenshot region centered at (x, y). No upscaling — returns\n" +
       "the cropped area at its original screen resolution.\n\n" +
-      "WARNING: calling this tool changes the active coordinate context. All subsequent\n" +
-      "mouse/keyboard coordinate inputs must come from THIS zoom image, not from any\n" +
-      "prior screenshot. To return to full-screen coordinates, take a new full-screen screenshot.\n\n" +
+      "This tool returns a new screenshot_id. Use coordinates read from THIS zoom image\n" +
+      "together with THIS screenshot_id for subsequent mouse/keyboard actions.\n" +
+      "To return to full-screen coordinates, take a new full-screen screenshot.\n\n" +
       "Use after element_at returns no useful element — game UI, images, canvas,\n" +
       "web pages, map coordinates. Gives a close-up pixel-level view of a single target.\n\n" +
       "Use width/height to control the crop area (default 200×200 screenshot pixels).\n" +
@@ -288,10 +288,13 @@ export const TOOLS: Tool[] = [
   {
     name: "screenshot_annotate",
     description:
-      "VERIFICATION ONLY — does NOT change the active coordinate context.\n\n" +
-      "Take a screenshot with coordinate markers drawn on it.\n" +
-      "Coordinates passed to mouse/keyboard tools must still come from the last screenshot\n" +
-      "or screenshot_zoom call, not from this annotated image.\n\n" +
+      "VERIFICATION ONLY — never use this image as a coordinate source.\n\n" +
+      "Draws markers on a screenshot to confirm where coordinates will land. " +
+      "The annotated image is for human/model visual inspection only — " +
+      "DO NOT read pixel coordinates from it and pass them to mouse/keyboard tools.\n\n" +
+      "ALL actionable coordinates must come from screenshot or screenshot_zoom. " +
+      "The screenshot_id returned by this tool is the same as the one you passed in; " +
+      "it refers to the original screenshot's coordinate space, not this annotated image.\n\n" +
       "Best for: verifying multiple coordinates at once, or when you need to see\n" +
       "where a point falls within the full-screen context. Prefer screenshot_zoom\n" +
       "for isolated single-target close-up verification.\n\n" +
@@ -354,7 +357,7 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "mouse_click",
-    description: `Click the mouse at (x, y). ${COORD_NOTE}`,
+    description: `Click the mouse at (x, y). ${COORD_NOTE}\n\nREQUIRED BEFORE clicking: (1) use screenshot_zoom to inspect the target area up close, (2) use screenshot_annotate to confirm the coordinate lands on the intended element. Do NOT estimate visually.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -375,7 +378,7 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "mouse_double_click",
-    description: `Double-click the mouse at (x, y). Use instead of two sequential mouse_click calls to avoid OS double-click threshold issues. ${COORD_NOTE}`,
+    description: `Double-click the mouse at (x, y). Use instead of two sequential mouse_click calls to avoid OS double-click threshold issues. ${COORD_NOTE}\n\nREQUIRED BEFORE double-clicking: (1) use screenshot_zoom to inspect the target area up close, (2) use screenshot_annotate to confirm the coordinate lands on the intended element. Do NOT estimate visually.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -468,10 +471,12 @@ export const TOOLS: Tool[] = [
         },
         screenshot_id: {
           type: "string",
-          description: "Required if providing x and y coordinates. ID of the screenshot from which the coordinates were read.",
+          description: "Required when x and y are provided. ID of the screenshot from which the coordinates were read.",
         },
       },
       required: [],
+      // NOTE: JSON Schema cannot express conditional required (x+y+screenshot_id together-or-none).
+      // The description above documents the contract; the handler enforces it at runtime.
     },
   },
   {
@@ -722,8 +727,11 @@ export const TOOLS: Tool[] = [
       "Use this for precise coordinates of small, dense, or hard-to-distinguish " +
       "elements (list items, menu entries, toolbar buttons). Use list_windows first to get the " +
       "window handle, or pass a title substring. Prefer screenshot + visual coordinate picking for " +
-      "large, obvious targets. Returned element center and bounding_rect are in screenshot pixels. " +
-      `Take a screenshot first to ensure coordinate alignment. ${COORD_NOTE}`,
+      "large, obvious targets. " +
+      "Pass screenshot_id (from a recent screenshot) to get element center and bounding_rect " +
+      "remapped to screenshot image pixels — ready to pass directly to mouse tools. " +
+      "Without screenshot_id, coordinates are returned in logical pixels (not usable with mouse tools " +
+      "until you take a screenshot and pass its ID).",
     inputSchema: {
       type: "object",
       properties: {
@@ -738,6 +746,10 @@ export const TOOLS: Tool[] = [
         max_depth: { type: "integer", description: "Search depth limit (default 5, max 20)" },
         max_results: { type: "integer", description: "Maximum elements to return (default 20, max 100)" },
         timeout: { type: "number", description: "Search timeout in seconds (default 5.0, max 30)" },
+        screenshot_id: {
+          type: "string",
+          description: "ID of a recent screenshot. When provided, returned center and bounding_rect are in screenshot image pixels for direct use with mouse tools.",
+        },
       },
     },
   },
@@ -808,8 +820,6 @@ export async function handleTool(
           }
           body.width  = resolveDim(args.width  as number | string, screenshotId);
           body.height = resolveDim(args.height as number | string, screenshotId);
-        } else {
-          body.ruler = true;
         }
 
         const resp = await enginePost<{
@@ -840,29 +850,18 @@ export async function handleTool(
           contentH: lh,
         };
         const screenshotId = registerScreenshot(transform);
-        const idLine =
-          `Screenshot ID: ${screenshotId} | origin=(${logicalLeft},${logicalTop}) ` +
-          `scale=${resp.data.image_scale.toFixed(2)} content=${lw}\u00d7${lh}`;
+        const idLine = `Screenshot ID: ${screenshotId}`;
 
         let meta: string;
         if (isCrop) {
           meta =
             `${idLine}\n` +
-            `Screenshot: ${iw}\u00d7${ih} image pixels (logical ${lw}\u00d7${lh}, physical ${pw}\u00d7${ph}, ` +
-            `DPI scale ${resp.data.dpi_scale}, image scale ${resp.data.image_scale.toFixed(4)}). ` +
-            `Crop origin: logical (${logicalLeft}, ${logicalTop}). Coordinates from this image are in crop-relative image pixels, automatically remapped.`;
+            `Crop screenshot (${iw}\u00d7${ih} image pixels). ` +
+            `Coordinates from this image are automatically remapped — just pass this screenshot_id.`;
         } else {
-          const rulerWidth = resp.data.ruler_width ?? 0;
-          const rulerHeight = resp.data.ruler_height ?? 0;
-          const contentW = iw - rulerWidth;
-          const contentH = ih - rulerHeight;
           meta =
             `${idLine}\n` +
-            `Screenshot: content ${contentW}\u00d7${contentH} image pixels (full image ${iw}\u00d7${ih} includes ruler strips, ` +
-            `logical ${lw}\u00d7${lh}, physical ${pw}\u00d7${ph}, DPI scale ${resp.data.dpi_scale}, ` +
-            `image scale ${resp.data.image_scale.toFixed(4)}). ` +
-            `Ruler strips: ${rulerWidth}px right (Y), ${rulerHeight}px bottom (X) \u2014 ruler labels are image pixel coordinates, not logical coordinates. ` +
-            `Use image pixel coordinates from the content area only (x: 0\u2013${contentW - 1}, y: 0\u2013${contentH - 1}); the ruler strips are not click targets and must not be used as coordinate sources.`;
+            `Screenshot: ${iw}\u00d7${ih} image pixels.`;
         }
 
         return {
@@ -899,22 +898,16 @@ export async function handleTool(
           annotate: (args.annotate as boolean | undefined) ?? true,
         };
 
-        const resp = await enginePost<{
-          image: string;
-          dpi_scale: number;
-          image_scale: number;
-          logical_size: [number, number];
-          image_size: [number, number];
-          physical_size: [number, number];
-          virtual_origin: unknown;
-        }>("/screenshot/zoom", zoomBody);
+        const resp = await enginePost<ZoomData>("/screenshot/zoom", zoomBody);
 
         if (!resp.success) {
           return errorContent(`screenshot_zoom failed: ${resp.error ?? "unknown error"}`);
         }
 
-        const cropOriginX = logicalX - Math.floor(logicalW / 2);
-        const cropOriginY = logicalY - Math.floor(logicalH / 2);
+        // Use engine-reported origin (clamped at screen edges) rather than self-calculating,
+        // so the registry transform matches the actual image region when the crop is clipped.
+        const cropOriginX = resp.data.virtual_origin.x;
+        const cropOriginY = resp.data.virtual_origin.y;
 
         const [lw, lh] = resp.data.logical_size;
         const [iw, ih] = resp.data.image_size;
@@ -929,24 +922,11 @@ export async function handleTool(
           contentH: lh,
         };
         const newId = registerScreenshot(newTransform);
-        const idLine =
-          `Screenshot ID: ${newId} | origin=(${cropOriginX},${cropOriginY}) ` +
-          `scale=${resp.data.image_scale.toFixed(2)} content=${lw}\u00d7${lh}`;
 
-        const fxFormula = (lw === iw)
-          ? `${cropOriginX} + zoom_x`
-          : `${cropOriginX} + round(zoom_x \u00d7 ${lw}/${iw})`;
-        const fyFormula = (lh === ih)
-          ? `${cropOriginY} + zoom_y`
-          : `${cropOriginY} + round(zoom_y \u00d7 ${lh}/${ih})`;
         const meta =
-          `${idLine}\n` +
-          `Zoom screenshot (${iw}\u00d7${ih} image pixels, logical ${lw}\u00d7${lh}, physical ${pw}\u00d7${ph}, ` +
-          `DPI scale ${resp.data.dpi_scale}, image scale ${resp.data.image_scale.toFixed(4)}). ` + // NOTE: this exact format is used as a structural anchor in P1 — do not change without updating the P1 insertion logic.
-          `Crop origin: logical (${cropOriginX}, ${cropOriginY}).\n` +
-          `To convert zoom-image coordinates to full-screen logical:\n` +
-          `  full_x = ${fxFormula}\n` +
-          `  full_y = ${fyFormula}`;
+          `Screenshot ID: ${newId}\n` +
+          `Zoom screenshot (${iw}\u00d7${ih} image pixels). ` +
+          `Use this screenshot\u2019s ID with mouse tools \u2014 coordinates are automatically remapped.`;
 
         return {
           content: [
@@ -1013,8 +993,9 @@ export async function handleTool(
         // screenshot's transform is still in the registry under the same ID.
         const idPrefix = annotScreenshotId ? `Screenshot ID: ${annotScreenshotId}\n` : "";
         let meta =
-          `${idPrefix}Annotated screenshot: ${iw}\u00d7${ih} image pixels (logical ${lw}\u00d7${lh}, ` +
-          `image scale ${resp.data.image_scale.toFixed(4)}).`;
+          `${idPrefix}Annotated screenshot: ${iw}\u00d7${ih} image pixels` +
+          // ` (logical ${lw}\u00d7${lh}, image scale ${resp.data.image_scale.toFixed(4)})` +
+          `.`;
         if (skipped.length > 0) {
           meta += ` WARNING: annotations at indices [${skipped.join(", ")}] were outside the image bounds — re-check those coordinates.`;
         }
@@ -1032,7 +1013,7 @@ export async function handleTool(
         const screenshotId = args.screenshot_id as string | undefined;
         if (!screenshotId) {
           return errorContent(
-            "screenshot_id is required. Call screenshot, screenshot_zoom, or screenshot_annotate first to get a valid ID."
+            "screenshot_id is required. Call screenshot or screenshot_zoom first to get a valid ID."
           );
         }
         let logicalX: number, logicalY: number;
@@ -1050,7 +1031,7 @@ export async function handleTool(
         const screenshotId = args.screenshot_id as string | undefined;
         if (!screenshotId) {
           return errorContent(
-            "screenshot_id is required. Call screenshot, screenshot_zoom, or screenshot_annotate first to get a valid ID."
+            "screenshot_id is required. Call screenshot or screenshot_zoom first to get a valid ID."
           );
         }
         let logicalX: number, logicalY: number;
@@ -1089,7 +1070,7 @@ export async function handleTool(
         const screenshotId = args.screenshot_id as string | undefined;
         if (!screenshotId) {
           return errorContent(
-            "screenshot_id is required. Call screenshot, screenshot_zoom, or screenshot_annotate first to get a valid ID."
+            "screenshot_id is required. Call screenshot or screenshot_zoom first to get a valid ID."
           );
         }
         let logicalX: number, logicalY: number;
@@ -1128,7 +1109,7 @@ export async function handleTool(
         const screenshotId = args.screenshot_id as string | undefined;
         if (!screenshotId) {
           return errorContent(
-            "screenshot_id is required. Call screenshot, screenshot_zoom, or screenshot_annotate first to get a valid ID."
+            "screenshot_id is required. Call screenshot or screenshot_zoom first to get a valid ID."
           );
         }
         let lx1: number, ly1: number, lx2: number, ly2: number;
@@ -1159,7 +1140,7 @@ export async function handleTool(
         const screenshotId = args.screenshot_id as string | undefined;
         if (!screenshotId) {
           return errorContent(
-            "screenshot_id is required. Call screenshot, screenshot_zoom, or screenshot_annotate first to get a valid ID."
+            "screenshot_id is required. Call screenshot or screenshot_zoom first to get a valid ID."
           );
         }
         let logicalX: number, logicalY: number;
@@ -1200,7 +1181,7 @@ export async function handleTool(
         const screenshotId = args.screenshot_id as string | undefined;
         if (!screenshotId) {
           return errorContent(
-            "screenshot_id is required. Call screenshot, screenshot_zoom, or screenshot_annotate first to get a valid ID."
+            "screenshot_id is required. Call screenshot or screenshot_zoom first to get a valid ID."
           );
         }
         let logicalX: number, logicalY: number;
@@ -1354,8 +1335,10 @@ export async function handleTool(
         if (args.timeout !== undefined) body.timeout = args.timeout;
         const resp = await enginePost<unknown>("/find_element", body);
         if (!resp.success) return errorContent(`find_element failed: ${resp.error}`);
-        const findScreenshotId = args.screenshot_id as string | undefined;
-        const findT = findScreenshotId !== undefined ? lookupTransform(findScreenshotId) : undefined;
+        const findScreenshotId = args.screenshot_id;
+        const findT = (typeof findScreenshotId === "string" && findScreenshotId)
+          ? lookupTransform(findScreenshotId)
+          : undefined;
         return textContent(JSON.stringify(remapElementCoords(resp.data, findT), null, 2));
       }
 
@@ -1363,7 +1346,7 @@ export async function handleTool(
         const screenshotId = args.screenshot_id as string | undefined;
         if (!screenshotId) {
           return errorContent(
-            "screenshot_id is required. Call screenshot, screenshot_zoom, or screenshot_annotate first to get a valid ID."
+            "screenshot_id is required. Call screenshot or screenshot_zoom first to get a valid ID."
           );
         }
         let lx: number, ly: number;

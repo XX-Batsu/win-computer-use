@@ -44,11 +44,14 @@ function _getOrThrow(screenshotId: string): ScreenshotTransform {
   return t;
 }
 
-/** Convert MCP tool arg to number. Inputs are always JSON-parsed numbers or numeric strings;
- *  non-finite values (NaN, Infinity) default to 0, which is safe for coordinate arithmetic. */
+/** Convert MCP tool arg to number. Throws for non-numeric inputs (NaN, Infinity, non-numeric strings)
+ *  so that invalid coordinates produce an explicit error instead of silently clicking at origin. */
 function _toNum(v: number | string): number {
   const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
+  if (!Number.isFinite(n)) {
+    throw new Error(`Invalid coordinate: expected a finite number, got ${JSON.stringify(v)}`);
+  }
+  return n;
 }
 
 export function resolveCoords(

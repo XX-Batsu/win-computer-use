@@ -223,13 +223,24 @@ async def take_screenshot(req: ScreenshotRequest):
             )
 
             if full_screen:
-                # Capture entire virtual desktop.
+                # Compute capture region from monitor_map (Win32 EnumDisplayMonitors,
+                # active monitors only) rather than mss.monitors[0] (virtual desktop
+                # bounding box, which may include ghost/inactive displays and produce
+                # a large black-padded image).
                 # NOTE (mixed-DPI limitation): The primary monitor's DPI scale is
                 # applied uniformly to the whole image.  On setups where monitors
                 # have different DPI scales, coordinates on non-primary monitors
                 # will be slightly misaligned.  Accurate multi-DPI support would
                 # require per-monitor capture-and-stitch.
-                monitor = virtual_mon
+                if monitor_map:
+                    phys_l = min(m["physical_left"]   for m in monitor_map)
+                    phys_t = min(m["physical_top"]    for m in monitor_map)
+                    phys_r = max(m["physical_right"]  for m in monitor_map)
+                    phys_b = max(m["physical_bottom"] for m in monitor_map)
+                    monitor = {"left": phys_l, "top": phys_t,
+                               "width": phys_r - phys_l, "height": phys_b - phys_t}
+                else:
+                    monitor = virtual_mon  # fallback
                 dpi_scale = dpi_utils.get_primary_scale(monitor_map)
             else:
                 # Convert logical region to physical region
@@ -350,8 +361,7 @@ async def screenshot_zoom(req: ZoomRequest):
         dpi_scale = scale
 
         with mss.mss() as sct:
-            virtual_mon = sct.monitors[0]
-            virtual_origin = {"x": virtual_mon["left"], "y": virtual_mon["top"]}
+            virtual_origin = {"x": left, "y": top}  # actual crop top-left in logical coords
             screenshot = sct.grab(monitor)
             # mss BGRA pixel format; "BGRX" treats 4th byte as ignored padding → RGB
             img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
