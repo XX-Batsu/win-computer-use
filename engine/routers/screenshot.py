@@ -202,7 +202,9 @@ class AnnotateRequest(BaseModel):
 @router.post("/screenshot")
 async def take_screenshot(req: ScreenshotRequest):
     try:
-        monitor_map = dpi_utils.get_monitor_map()
+        # Refresh monitor map on every screenshot so resolution/DPI changes
+        # are picked up immediately without requiring an engine restart.
+        monitor_map = dpi_utils.reload_monitor_map()
 
         with mss.mss() as sct:
             # Determine virtual screen origin from mss monitor index 0
@@ -335,7 +337,7 @@ async def take_screenshot(req: ScreenshotRequest):
 @router.post("/screenshot/zoom")
 async def screenshot_zoom(req: ZoomRequest):
     try:
-        monitor_map = dpi_utils.get_monitor_map()
+        monitor_map = dpi_utils.reload_monitor_map()
 
         left = req.x - req.width // 2
         top = req.y - req.height // 2
@@ -417,7 +419,7 @@ async def screenshot_zoom(req: ZoomRequest):
 @router.post("/screenshot/annotate")
 async def screenshot_annotate(req: AnnotateRequest):
     try:
-        monitor_map = dpi_utils.get_monitor_map()
+        monitor_map = dpi_utils.reload_monitor_map()
 
         with mss.mss() as sct:
             virtual_mon = sct.monitors[0]

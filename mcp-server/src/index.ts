@@ -257,6 +257,9 @@ export const TOOLS: Tool[] = [
       "(top/left without width/height are ignored and result in a full-screen capture). " +
       "Coordinates from the most recent screenshot (whether full-screen or crop) can be passed " +
       "directly to mouse and keyboard tools; the MCP layer remaps them automatically. " +
+      "NEXT STEP: prefer element_at or find_element (zero image tokens, semantic info) to identify " +
+      "targets before clicking. Fall back to screenshot_zoom or screenshot_annotate only when " +
+      "UI Automation returns nothing useful (e.g. canvas, browser content, custom-drawn areas). " +
       COORD_NOTE,
     inputSchema: {
       type: "object",
@@ -380,7 +383,7 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "mouse_click",
-    description: `Click the mouse at (x, y). ${COORD_NOTE}\n\nREQUIRED: before clicking, call screenshot_zoom (preferred) or screenshot_annotate to visually verify the coordinate, then pass the annotate_token it returns. Each token is single-use — one annotate/zoom per click.`,
+    description: `Click the mouse at (x, y). ${COORD_NOTE}\n\nREQUIRED: obtain an annotate_token before clicking. Priority order:\n1. element_at / find_element — best for standard UI (buttons, menus, inputs); zero image tokens\n2. screenshot_zoom — visual verification for non-standard UI (canvas, games, web)\n3. screenshot_annotate — full-screen multi-point verification\nEach token is single-use — one verification per click.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -397,7 +400,7 @@ export const TOOLS: Tool[] = [
         },
         annotate_token: {
           type: "string",
-          description: "One-time token returned by screenshot_annotate. Required — proves you visually verified the coordinate.",
+          description: "One-time token from element_at, find_element, screenshot_zoom, or screenshot_annotate. Required.",
         },
       },
       required: ["x", "y", "screenshot_id", "annotate_token"],
@@ -405,7 +408,7 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "mouse_double_click",
-    description: `Double-click the mouse at (x, y). Use instead of two sequential mouse_click calls to avoid OS double-click threshold issues. ${COORD_NOTE}\n\nREQUIRED: before double-clicking, call screenshot_zoom (preferred) or screenshot_annotate to visually verify the coordinate, then pass the annotate_token it returns. Each token is single-use — one annotate/zoom per click.`,
+    description: `Double-click the mouse at (x, y). Use instead of two sequential mouse_click calls to avoid OS double-click threshold issues. ${COORD_NOTE}\n\nREQUIRED: obtain an annotate_token before double-clicking. Priority order:\n1. element_at / find_element — best for standard UI (buttons, menus, inputs); zero image tokens\n2. screenshot_zoom — visual verification for non-standard UI (canvas, games, web)\n3. screenshot_annotate — full-screen multi-point verification\nEach token is single-use — one verification per click.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -422,7 +425,7 @@ export const TOOLS: Tool[] = [
         },
         annotate_token: {
           type: "string",
-          description: "One-time token returned by screenshot_annotate. Required — proves you visually verified the coordinate.",
+          description: "One-time token from element_at, find_element, screenshot_zoom, or screenshot_annotate. Required.",
         },
       },
       required: ["x", "y", "screenshot_id", "annotate_token"],
@@ -762,7 +765,10 @@ export const TOOLS: Tool[] = [
       "Pass screenshot_id (from a recent screenshot) to get element center and bounding_rect " +
       "remapped to screenshot image pixels — ready to pass directly to mouse tools. " +
       "Without screenshot_id, coordinates are returned in logical pixels (not usable with mouse tools " +
-      "until you take a screenshot and pass its ID).",
+      "until you take a screenshot and pass its ID).\n\n" +
+      "Returns an annotate_token (one-time use). mouse_click and mouse_double_click require " +
+      "this token. Prefer this tool over screenshot_zoom/screenshot_annotate for standard UI — " +
+      "it uses zero image tokens.",
     inputSchema: {
       type: "object",
       properties: {
@@ -795,7 +801,10 @@ export const TOOLS: Tool[] = [
       "Not suitable for: game canvases, browser content, map tiles, custom-drawn areas,\n" +
       "or any region where UI Automation returns nothing useful.\n" +
       "Fall back to screenshot_zoom or screenshot_annotate if this returns an empty\n" +
-      "result or a generic/unhelpful element type.",
+      "result or a generic/unhelpful element type.\n\n" +
+      "Returns an annotate_token (one-time use). mouse_click and mouse_double_click require " +
+      "this token. Prefer this tool over screenshot_zoom/screenshot_annotate for standard UI — " +
+      "it uses zero image tokens.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1071,9 +1080,14 @@ export async function handleTool(
             "screenshot_id is required. Call screenshot or screenshot_zoom first to get a valid ID."
           );
         }
+        const rawX = args.x as number | string;
+        const rawY = args.y as number | string;
         let logicalX: number, logicalY: number;
+        let diagScale = 0;
         try {
-          ({ logicalX, logicalY } = resolveCoords(args.x as number | string, args.y as number | string, screenshotId));
+          const t = lookupTransform(screenshotId);
+          if (t) diagScale = t.scale;
+          ({ logicalX, logicalY } = resolveCoords(rawX, rawY, screenshotId));
         } catch (e) {
           return errorContent((e as Error).message);
         }
@@ -1085,7 +1099,7 @@ export async function handleTool(
         });
         if (!clickResp.success) return errorContent(`mouse_click failed: ${clickResp.error}`);
 
-        const confirmText = `Mouse clicked at logical (${logicalX}, ${logicalY}).`;
+        const confirmText = `Mouse clicked at logical (${logicalX}, ${logicalY}).\n[DIAG] raw=(${rawX}, ${rawY}) scale=${diagScale} → logical=(${logicalX}, ${logicalY})`;
         let zoomResp: EngineResponse<ZoomData>;
         try {
           zoomResp = await fetchZoomRaw(logicalX, logicalY);
@@ -1113,9 +1127,14 @@ export async function handleTool(
             "screenshot_id is required. Call screenshot or screenshot_zoom first to get a valid ID."
           );
         }
+        const rawX = args.x as number | string;
+        const rawY = args.y as number | string;
         let logicalX: number, logicalY: number;
+        let diagScale = 0;
         try {
-          ({ logicalX, logicalY } = resolveCoords(args.x as number | string, args.y as number | string, screenshotId));
+          const t = lookupTransform(screenshotId);
+          if (t) diagScale = t.scale;
+          ({ logicalX, logicalY } = resolveCoords(rawX, rawY, screenshotId));
         } catch (e) {
           return errorContent((e as Error).message);
         }
@@ -1127,7 +1146,7 @@ export async function handleTool(
         });
         if (!clickResp.success) return errorContent(`mouse_double_click failed: ${clickResp.error}`);
 
-        const confirmText = `Mouse double-clicked at logical (${logicalX}, ${logicalY}).`;
+        const confirmText = `Mouse double-clicked at logical (${logicalX}, ${logicalY}).\n[DIAG] raw=(${rawX}, ${rawY}) scale=${diagScale} → logical=(${logicalX}, ${logicalY})`;
         let zoomResp: EngineResponse<ZoomData>;
         try {
           zoomResp = await fetchZoomRaw(logicalX, logicalY);
@@ -1379,7 +1398,9 @@ export async function handleTool(
         const findT = (typeof findScreenshotId === "string" && findScreenshotId)
           ? lookupTransform(findScreenshotId)
           : undefined;
-        return textContent(JSON.stringify(remapElementCoords(resp.data, findT), null, 2));
+        const findToken = generateAnnotateToken();
+        const findResult = JSON.stringify(remapElementCoords(resp.data, findT), null, 2);
+        return textContent(`${findResult}\nannotate_token: ${findToken}`);
       }
 
       case "element_at": {
@@ -1396,7 +1417,9 @@ export async function handleTool(
         if (!resp.success) return errorContent(`element_at failed: ${resp.error}`);
         if (resp.data === null) return textContent(resp.error ?? "No element found at this coordinate.");
         const t = lookupTransform(screenshotId);
-        return textContent(JSON.stringify(remapElementCoords(resp.data, t), null, 2));
+        const elemToken = generateAnnotateToken();
+        const elemResult = JSON.stringify(remapElementCoords(resp.data, t), null, 2);
+        return textContent(`${elemResult}\nannotate_token: ${elemToken}`);
       }
 
       default:
