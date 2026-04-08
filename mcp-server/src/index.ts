@@ -226,6 +226,24 @@ const COORD_NOTE =
   "you are reading coordinates from. Using the wrong screenshot_id will cause the click to " +
   "land in the wrong place.";
 
+// ── Annotate-token registry (one-time-use tokens) ───────────────────────────
+// screenshot_annotate produces a token; mouse_click / mouse_double_click
+// consume it. This enforces visual verification before every click.
+const annotateTokens = new Set<string>();
+
+function generateAnnotateToken(): string {
+  const token = Math.random().toString(36).slice(2, 10);
+  annotateTokens.add(token);
+  return token;
+}
+
+function consumeAnnotateToken(token: string | undefined): string | null {
+  if (!token) return "annotate_token is required. Call screenshot_annotate first to get a token.";
+  if (!annotateTokens.has(token)) return "Invalid or already-used annotate_token. Call screenshot_annotate again to get a fresh token.";
+  annotateTokens.delete(token);
+  return null; // valid
+}
+
 export const TOOLS: Tool[] = [
   {
     name: "screenshot",
@@ -269,7 +287,9 @@ export const TOOLS: Tool[] = [
       "If the crop region extends beyond the screen edge, the out-of-screen portion\n" +
       "appears as black pixels — this is expected and does not indicate a wrong coordinate.\n\n" +
       "Prefer screenshot_annotate when you need to see where a coordinate sits in\n" +
-      "full-screen context, or when verifying multiple coordinates at once.",
+      "full-screen context, or when verifying multiple coordinates at once.\n\n" +
+      "Returns an annotate_token (one-time use). mouse_click and mouse_double_click require " +
+      "this token — you MUST call screenshot_zoom or screenshot_annotate before every click.",
     inputSchema: {
       type: "object",
       properties: {
@@ -309,7 +329,9 @@ export const TOOLS: Tool[] = [
       "actionable coordinates.\n\n" +
       "Returns skipped_annotations with the indices of any annotations outside the image bounds.\n" +
       "If skipped_annotations is non-empty, those coordinates were off-screen or outside the\n" +
-      "crop region — re-check the coordinates before acting on them.",
+      "crop region — re-check the coordinates before acting on them.\n\n" +
+      "Returns an annotate_token (one-time use). mouse_click and mouse_double_click require " +
+      "this token — you MUST call screenshot_annotate before every click.",
     inputSchema: {
       type: "object",
       properties: {
@@ -358,7 +380,7 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "mouse_click",
-    description: `Click the mouse at (x, y). ${COORD_NOTE}\n\nREQUIRED BEFORE clicking: (1) use screenshot_zoom to inspect the target area up close, (2) use screenshot_annotate to confirm the coordinate lands on the intended element. Do NOT estimate visually.`,
+    description: `Click the mouse at (x, y). ${COORD_NOTE}\n\nREQUIRED: before clicking, call screenshot_zoom (preferred) or screenshot_annotate to visually verify the coordinate, then pass the annotate_token it returns. Each token is single-use — one annotate/zoom per click.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -373,13 +395,17 @@ export const TOOLS: Tool[] = [
           type: "string",
           description: "ID returned by the screenshot tool that produced the image you are clicking on. Required.",
         },
+        annotate_token: {
+          type: "string",
+          description: "One-time token returned by screenshot_annotate. Required — proves you visually verified the coordinate.",
+        },
       },
-      required: ["x", "y", "screenshot_id"],
+      required: ["x", "y", "screenshot_id", "annotate_token"],
     },
   },
   {
     name: "mouse_double_click",
-    description: `Double-click the mouse at (x, y). Use instead of two sequential mouse_click calls to avoid OS double-click threshold issues. ${COORD_NOTE}\n\nREQUIRED BEFORE double-clicking: (1) use screenshot_zoom to inspect the target area up close, (2) use screenshot_annotate to confirm the coordinate lands on the intended element. Do NOT estimate visually.`,
+    description: `Double-click the mouse at (x, y). Use instead of two sequential mouse_click calls to avoid OS double-click threshold issues. ${COORD_NOTE}\n\nREQUIRED: before double-clicking, call screenshot_zoom (preferred) or screenshot_annotate to visually verify the coordinate, then pass the annotate_token it returns. Each token is single-use — one annotate/zoom per click.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -394,8 +420,12 @@ export const TOOLS: Tool[] = [
           type: "string",
           description: "ID returned by the screenshot tool that produced the image you are clicking on. Required.",
         },
+        annotate_token: {
+          type: "string",
+          description: "One-time token returned by screenshot_annotate. Required — proves you visually verified the coordinate.",
+        },
       },
-      required: ["x", "y", "screenshot_id"],
+      required: ["x", "y", "screenshot_id", "annotate_token"],
     },
   },
   {
@@ -924,10 +954,12 @@ export async function handleTool(
         };
         const newId = registerScreenshot(newTransform);
 
+        const zoomToken = generateAnnotateToken();
         const meta =
           `Screenshot ID: ${newId}\n` +
           `Zoom screenshot (${iw}\u00d7${ih} image pixels). ` +
-          `Use this screenshot\u2019s ID with mouse tools \u2014 coordinates are automatically remapped.`;
+          `Use this screenshot\u2019s ID with mouse tools \u2014 coordinates are automatically remapped.\n` +
+          `annotate_token: ${zoomToken}`;
 
         return {
           content: [
@@ -992,13 +1024,14 @@ export async function handleTool(
         // The shorter format (no origin/scale/content) is intentional: annotate does not
         // register a new transform, so there is no new metadata to report. The original
         // screenshot's transform is still in the registry under the same ID.
+        const annotateToken = generateAnnotateToken();
         const idPrefix = annotScreenshotId ? `Screenshot ID: ${annotScreenshotId}\n` : "";
         let meta =
           `${idPrefix}Annotated screenshot: ${iw}\u00d7${ih} image pixels` +
           // ` (logical ${lw}\u00d7${lh}, image scale ${resp.data.image_scale.toFixed(4)})` +
-          `.`;
+          `.\nannotate_token: ${annotateToken}`;
         if (skipped.length > 0) {
-          meta += ` WARNING: annotations at indices [${skipped.join(", ")}] were outside the image bounds — re-check those coordinates.`;
+          meta += `\nWARNING: annotations at indices [${skipped.join(", ")}] were outside the image bounds — re-check those coordinates.`;
         }
 
         return {
@@ -1029,6 +1062,9 @@ export async function handleTool(
       }
 
       case "mouse_click": {
+        const tokenErr = consumeAnnotateToken(args.annotate_token as string | undefined);
+        if (tokenErr) return errorContent(tokenErr);
+
         const screenshotId = args.screenshot_id as string | undefined;
         if (!screenshotId) {
           return errorContent(
@@ -1068,6 +1104,9 @@ export async function handleTool(
       }
 
       case "mouse_double_click": {
+        const tokenErr = consumeAnnotateToken(args.annotate_token as string | undefined);
+        if (tokenErr) return errorContent(tokenErr);
+
         const screenshotId = args.screenshot_id as string | undefined;
         if (!screenshotId) {
           return errorContent(
