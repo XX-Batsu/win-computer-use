@@ -10,6 +10,7 @@ import {
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
+import { spawn } from "child_process";
 import {
   registerScreenshot,
   resolveCoords,
@@ -1383,11 +1384,86 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   return handleTool(name, (args ?? {}) as Args);
 });
 
+// ── Auto-start engine ────────────────────────────────────────────────────────
+
+const PROJECT_ROOT = join(__dirname, "..", "..");
+const ENGINE_DIR = join(PROJECT_ROOT, "engine");
+const PYTHON_EXE = join(ENGINE_DIR, "venv", "Scripts", "python.exe");
+
+async function isEngineRunning(): Promise<boolean> {
+  try {
+    const res = await fetch(`${ENGINE_URL}/health`, {
+      headers: authHeaders(),
+      signal: AbortSignal.timeout(2000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function killEngineOnPort(): Promise<void> {
+  try {
+    // Find PID listening on engine port
+    const url = new URL(ENGINE_URL);
+    const port = url.port || "8765";
+    const { execSync } = await import("child_process");
+    const out = execSync(
+      `netstat -ano | findstr ":${port} " | findstr "LISTENING"`,
+      { encoding: "utf-8", timeout: 5000, windowsHide: true },
+    ).trim();
+    const pids = new Set(
+      out.split("\n").map((l) => l.trim().split(/\s+/).pop()).filter(Boolean),
+    );
+    for (const pid of pids) {
+      try {
+        execSync(`taskkill /PID ${pid} /F`, { stdio: "ignore", timeout: 5000, windowsHide: true });
+        console.error(`[MCP] Killed old engine process (PID ${pid}).`);
+      } catch { /* already gone */ }
+    }
+    // Brief pause to let the port release
+    if (pids.size > 0) await new Promise((r) => setTimeout(r, 1000));
+  } catch {
+    // No process found on port — nothing to kill
+  }
+}
+
+async function ensureEngineRunning(): Promise<void> {
+  // Always kill old engine so we start fresh with latest code
+  await killEngineOnPort();
+
+  console.error("[MCP] Starting engine...");
+
+  const child = spawn(PYTHON_EXE, ["main.py"], {
+    cwd: ENGINE_DIR,
+    stdio: "ignore",
+    windowsHide: true,
+    env: { ...process.env, ENGINE_SECRET },
+  });
+  child.unref();
+
+  // Poll until engine is ready (up to 15 seconds)
+  const maxWait = 15_000;
+  const interval = 500;
+  const deadline = Date.now() + maxWait;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, interval));
+    if (await isEngineRunning()) {
+      console.error("[MCP] Engine started successfully.");
+      return;
+    }
+  }
+
+  console.error("[MCP] WARNING: Engine did not respond within 15 s — continuing anyway.");
+}
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 if (!ENGINE_SECRET) {
   console.error("WARNING: ENGINE_SECRET is not set. All requests to the engine will fail with 401.");
 }
+
+await ensureEngineRunning();
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
