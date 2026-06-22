@@ -35,6 +35,25 @@ Scheduler (cron) → claude -p → Python Engine HTTP API → logs/<task>/<times
 | `scheduler/`  | Python           | Cron-based task runner using Claude Code CLI headless mode |
 | `tasks/`      | YAML             | Task definitions (prompt, schedule, model, max steps) |
 
+## Comparison vs Windows-MCP
+
+The closest alternative is **[Windows-MCP](https://github.com/CursorTouch/Windows-MCP)** (CursorTouch, community OSS) — the one-click entry you see in the Claude Desktop Extensions marketplace. Neither Microsoft nor Anthropic ships an official *general* desktop-control MCP today: Microsoft's native "MCP on Windows" exposes sandboxed structured connectors (File Explorer, Settings), and Anthropic's "computer use" is a beta model tool with a Linux Docker reference implementation.
+
+| Dimension | win-computer-use | Windows-MCP |
+|-----------|------------------|-------------|
+| Install | manual (venv + `npm run build`) | `uvx` / marketplace one-click |
+| Runtimes | Python 3.12+ **and** Node 18+ | Python 3.13+ only |
+| Click safety | `annotate_token` pre-click gate | direct click |
+| Scheduling | built-in cron / headless | none |
+| Virtual desktops | yes | no |
+| System tools | `run_shell` | Registry / Process / FileSystem / Scrape |
+| Remote serving | localhost-only | authenticated network server (TLS/OAuth) |
+| License | MIT | MIT |
+
+**Pick win-computer-use** for click-verification stability, unattended cron automation, virtual desktops, and a tight localhost-only footprint. **Pick Windows-MCP** for one-click install, a single runtime, richer system tools, and remote deployment.
+
+See **[`comparison.html`](comparison.html)** for the full visual comparison.
+
 ## Requirements
 
 - Windows 10/11

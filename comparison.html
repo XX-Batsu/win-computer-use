@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>win-computer-use vs Windows-MCP - Comparison</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#fff; --ink:#1f2430; --muted:#5b6472;
+    --line:#e4e7ec; --a:#0d9488; --b:#7c3aed;
+    --ok:#16a34a; --no:#dc2626;
+    --shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:980px;margin:0 auto;padding:40px 22px 64px}
+  h1{font-size:28px;margin:0 0 6px;letter-spacing:-.02em}
+  h1 .v{color:var(--muted);font-weight:400}
+  .sub{color:var(--muted);font-size:15px;margin:0}
+  .meta{color:var(--muted);font-size:13px;margin-top:10px}
+  h2{font-size:18px;margin:38px 0 14px;letter-spacing:-.01em}
+  p{margin:0 0 12px}
+  code{background:#eef0f3;border:1px solid var(--line);border-radius:5px;
+    padding:1px 5px;font:12.5px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+    padding:16px;box-shadow:var(--shadow)}
+  .card h3{margin:0 0 6px;font-size:15px}
+  .card p{font-size:13.5px;color:var(--muted);margin:0}
+  .tag{display:inline-block;font-size:11px;font-weight:600;border-radius:999px;
+    padding:2px 9px;margin-bottom:8px}
+  .tag.comm{background:#fef3c7;color:#92400e}
+  .tag.ms{background:#dbeafe;color:#1e40af}
+  .tag.anth{background:#ede9fe;color:#5b21b6}
+  .note{background:#fff8e6;border:1px solid #f5e2a8;border-radius:10px;
+    padding:12px 14px;font-size:13.5px;color:#6b5512;margin-top:14px}
+  .tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow)}
+  table{border-collapse:collapse;width:100%;min-width:640px;background:var(--card)}
+  th,td{text-align:left;padding:11px 14px;border-bottom:1px solid var(--line);
+    vertical-align:top;font-size:13.5px}
+  thead th{background:#fbfbfc;font-size:12px;text-transform:uppercase;
+    letter-spacing:.04em;color:var(--muted)}
+  thead th.ca{color:var(--a)} thead th.cb{color:var(--b)}
+  tbody tr:nth-child(even){background:#fafbfc}
+  td.dim{font-weight:600;white-space:nowrap;color:var(--ink)}
+  .pc h3{margin:0 0 10px;font-size:15px;display:flex;align-items:center;gap:8px}
+  .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+  .dot.a{background:var(--a)} .dot.b{background:var(--b)}
+  ul.pl{list-style:none;margin:0;padding:0}
+  ul.pl li{position:relative;padding:4px 0 4px 22px;font-size:13.5px}
+  ul.pl li::before{position:absolute;left:0;top:4px;font-weight:700}
+  li.y::before{content:"\2713";color:var(--ok)}
+  li.n::before{content:"\2715";color:var(--no)}
+  .choose{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .choose .card{border-top:3px solid}
+  .choose .ca{border-top-color:var(--a)} .choose .cb{border-top-color:var(--b)}
+  .choose h3{margin:0 0 6px;font-size:14.5px}
+  footer{margin-top:40px;border-top:1px solid var(--line);padding-top:18px;
+    font-size:12.5px;color:var(--muted)}
+  footer a{color:var(--a);text-decoration:none}
+  footer a:hover{text-decoration:underline}
+  footer .src{margin:6px 0 0;padding-left:18px}
+  @media(max-width:720px){.grid3,.grid2,.choose{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>win-computer-use <span class="v">vs</span> Windows-MCP</h1>
+    <p class="sub">Two ways to let an AI agent drive a real Windows desktop over MCP &mdash; a concise comparison.</p>
+    <p class="meta">Generated 2026-06-23 &middot; win-computer-use = this repository</p>
+  </header>
+
+  <h2>Is there an <em>official</em> Windows-control MCP?</h2>
+  <p>No. The only MCP servers that drive the whole Windows desktop today are community or self-built.
+     The popular <strong>Windows-MCP</strong> in the Claude Desktop Extensions marketplace is third-party.</p>
+  <div class="grid3">
+    <div class="card">
+      <span class="tag comm">Community</span>
+      <h3>Windows-MCP</h3>
+      <p>By CursorTouch. MIT, ~6.2k&#9733;, listed in the MCP Registry &amp; Claude Desktop Extensions. <strong>Not</strong> a Microsoft or Anthropic product.</p>
+    </div>
+    <div class="card">
+      <span class="tag ms">Microsoft</span>
+      <h3>MCP on Windows</h3>
+      <p>Native ODR registry + sandboxed structured connectors (File Explorer, Settings) with consent/audit. Preview &mdash; <strong>not</strong> click-anywhere computer use.</p>
+    </div>
+    <div class="card">
+      <span class="tag anth">Anthropic</span>
+      <h3>Computer use</h3>
+      <p>A beta <em>model tool</em> (screenshot + mouse/keyboard) with a Linux <strong>Docker</strong> reference implementation. <strong>No</strong> Windows MCP server.</p>
+    </div>
+  </div>
+
+  <h2>Feature comparison</h2>
+  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr><th>Dimension</th><th class="ca">win-computer-use</th><th class="cb">Windows-MCP</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="dim">Origin / upkeep</td><td>Self-built local project; you own the code</td><td>Community OSS, ~6.2k&#9733;, marketplace one-click</td></tr>
+        <tr><td class="dim">Architecture</td><td>3-tier: TS MCP &harr; Python FastAPI engine <code>127.0.0.1:8765</code> &harr; Win API</td><td>Single Python MCP server (<code>uvx</code>)</td></tr>
+        <tr><td class="dim">Runtimes</td><td>Python 3.12+ <strong>and</strong> Node 18+</td><td>Python 3.13+ + UV only</td></tr>
+        <tr><td class="dim">Install</td><td><code>git clone</code> + <code>setup.bat</code> (manual)</td><td><code>uvx windows-mcp</code> / one-click</td></tr>
+        <tr><td class="dim">Screen perception</td><td>Hybrid; favors <code>element_at</code>/<code>find_element</code> (UIA) &rarr; exact coords, zero image tokens</td><td>Hybrid: <code>Screenshot</code> (fast) + <code>Snapshot</code> (full UIA tree)</td></tr>
+        <tr><td class="dim">Click safety</td><td><strong>annotate_token gate</strong> &mdash; must verify before every click</td><td>Direct click (UIA ids mitigate)</td></tr>
+        <tr><td class="dim">Tools</td><td>26 &mdash; incl. virtual desktops, window state, drag waypoints, zoom, annotate</td><td>18 &mdash; incl. Registry, Process, FileSystem, Notification, web Scrape, bulk edit</td></tr>
+        <tr><td class="dim">Multi-monitor / DPI</td><td>Explicit per-monitor DPI map + image&rarr;logical remap</td><td>UIA abstraction + <code>WINDOWS_MCP_SCREENSHOT_SCALE</code></td></tr>
+        <tr><td class="dim">Scheduling</td><td><strong>Built-in</strong> cron + YAML + <code>claude -p</code> headless + logs</td><td>None (interactive)</td></tr>
+        <tr><td class="dim">Deployment</td><td>localhost-only bind</td><td>Authenticated network server (IP allowlist, TLS, OAuth)</td></tr>
+        <tr><td class="dim">Security</td><td>localhost + inter-component Bearer; <code>run_shell</code> no <code>shell=True</code>, env denylist</td><td>Full system access, no sandbox; auth only in network mode</td></tr>
+        <tr><td class="dim">License</td><td>Personal project</td><td>MIT</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">Neither is OS-level sandboxed &mdash; unlike Microsoft's ODR container isolation. Run them only on trusted machines.</p>
+
+  <h2>Strengths &amp; weaknesses</h2>
+  <div class="grid2">
+    <div class="card pc">
+      <h3><span class="dot a"></span> win-computer-use</h3>
+      <ul class="pl">
+        <li class="y">Pre-click verification gate &rarr; fewer misclicks, lower tokens</li>
+        <li class="y">Built-in scheduled / headless automation (cron + logs)</li>
+        <li class="y">Virtual desktops; rigorous multi-monitor DPI handling</li>
+        <li class="y">Tight localhost-only security; full source control</li>
+        <li class="n">Heavier: two runtimes, 3-tier, manual setup</li>
+        <li class="n">Solo project: no community, updates, or one-click install</li>
+        <li class="n">Fewer dedicated system tools (covered via <code>run_shell</code>)</li>
+      </ul>
+    </div>
+    <div class="card pc">
+      <h3><span class="dot b"></span> Windows-MCP</h3>
+      <ul class="pl">
+        <li class="y">One-click / <code>uvx</code> install, marketplace, active community</li>
+        <li class="y">Single Python runtime &mdash; lighter</li>
+        <li class="y">Rich system tools (Registry, Process, FileSystem, Scrape)</li>
+        <li class="y">Deployable as an authenticated remote server; LLM-agnostic</li>
+        <li class="n">No pre-click verification gate</li>
+        <li class="n">No built-in scheduler; no virtual desktops</li>
+        <li class="n">Full system access, no sandbox &rarr; large blast radius</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>When to choose which</h2>
+  <div class="choose">
+    <div class="card ca">
+      <h3>Choose win-computer-use</h3>
+      <p>You want click-verification stability and token discipline, unattended cron automation, virtual desktops, a localhost-only footprint, and full control of the code.</p>
+    </div>
+    <div class="card cb">
+      <h3>Choose Windows-MCP</h3>
+      <p>You want the easiest install, a single runtime, rich system tools (registry / files / web), remote deployment, and community upkeep.</p>
+    </div>
+  </div>
+
+  <footer>
+    <div>Sources (fetched live, 2026-06-23):</div>
+    <ul class="src">
+      <li><a href="https://github.com/CursorTouch/Windows-MCP">github.com/CursorTouch/Windows-MCP</a></li>
+      <li><a href="https://learn.microsoft.com/en-us/windows/ai/mcp/overview">learn.microsoft.com &mdash; MCP on Windows overview</a></li>
+      <li><a href="https://platform.claude.com/docs/en/docs/build-with-claude/computer-use">platform.claude.com &mdash; Computer use tool</a></li>
+    </ul>
+    <p style="margin-top:10px">Note: "Desktop Extensions" (<code>.dxt</code>) is Anthropic's one-click <em>packaging</em> format &mdash; Windows-MCP ships through it. It is a distribution method, not a separate capability.</p>
+  </footer>
+</div>
+</body>
+</html>
